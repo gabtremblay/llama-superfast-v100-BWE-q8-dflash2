@@ -1,8 +1,9 @@
 # llama-superfast-v100-q8-inscora
 
 A fork of [bitexploder/llama-superfast-v100](https://github.com/bitexploder/llama-superfast-v100), the llama.cpp fork
-tuned for the Tesla V100 (Volta, `sm_70`), created for **one V100 card**, a **single user**, and **up to four concurrent
-slots** on a **unified KV cache**, to make agentic work palatable while maximizing context size. It adds:
+tuned for the Tesla V100 (Volta, `sm_70`), created for **one V100 card**, a **single user**, **up to four concurrent
+slots** on a **unified KV cache**, and the **DFlash2 speculative draft**, to make agentic work palatable while maximizing
+context size. It adds:
 
 - an 8-bit (`q8_0`) KV cache on upstream's fast Volta attention kernels, which with the memory changes below nearly
   doubles the context one 32 GB card holds, for a few percent of decode speed;
@@ -17,8 +18,13 @@ slots** on a **unified KV cache**, to make agentic work palatable while maximizi
 - prompt work (DFlash2 features, checkpoints, masks) that stays on the GPU instead of crossing the host link;
 - a smaller CUDA graph cache, which freed ~1.2 GB of VRAM that only grew under real traffic.
 
-The model is Qwen3.8-27B (`UD-Q4_K_XL`) with the DFlash2 draft on a V100 PCIe 32 GB. The slots serve one user: the
-main thinking thread, and the side requests an agent harness sends in parallel with it. Our card sits behind a PCIe Gen3 x4
+The model is Qwen3.8-27B (`UD-Q4_K_XL`) on a V100 PCIe 32 GB, decoded with [DFlash2](https://github.com/z-lab/dflash),
+z-lab's speculative draft for it: a small draft model that reads the target's own layer inputs and proposes a block of
+up to 7 tokens, which the 27B verifies in one step; about half are accepted, and that is what takes decode from the
+~40 tok/s a 27B manages alone on this card to ~105. Upstream ships DFlash2 beside Qwen's MTP head; this fork runs
+DFlash2 by default, and much of what follows (features kept on the GPU, the shared rollback snapshots, the scheduler's
+jobs) is built around it. The slots serve one user: the main thinking thread, and the side requests an agent harness
+sends in parallel with it. Our card sits behind a PCIe Gen3 x4
 eGPU link (~3.3 GB/s), so anything that crosses the host link is on the critical path; the gains from keeping work on
 the GPU are largest on a link like that.
 
