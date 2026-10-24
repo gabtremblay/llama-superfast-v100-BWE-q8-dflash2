@@ -66,8 +66,8 @@ cache grew under traffic (section 5). This fork runs the [Run](#run) line: four 
 | Single-stream decode (weighted median) | 108.9 tok/s | 104.5 tok/s |
 | Time to first token, single stream (p50) | 610 ms | 190 ms |
 | Cold prefill, 12k / 24k / 47k-token prompts | 877 / 858 / 795 tok/s | 961 / 915 / 830 tok/s |
-| Aggregate decode, 1 / 2 / 4 / 8 requests in flight | 90 / 101 / 89 / 88 tok/s | 92 / 99 / 154 / 152 tok/s |
-| Time to first token with 2 / 4 / 8 in flight (p50) | 2.3 s / 12.1 s / 32.7 s | 0.37 s / 0.42 s / 8.4 s |
+| Aggregate decode, 1 / 2 / 4 requests in flight | 90 / 101 / 89 tok/s | 92 / 99 / 154 tok/s |
+| Time to first token with 2 / 4 in flight (p50) | 2.3 s / 12.1 s | 0.37 s / 0.42 s |
 | Peak VRAM over the run | 31,044 MiB at 98,304 tokens | 32,266 MiB at 245,760 tokens |
 
 A lone stream decodes 4% slower, the cost of the 8-bit cache; everything else is ahead: the first token three times
@@ -384,7 +384,7 @@ of section 11 skipped those prefixes (its 1,024-cell cap).
   conversations to the top of an emptying pool, and the slots' decodes then read the whole used range: after four
   47k-token prompts, four short conversations decoded at 95 tok/s combined instead of 131.
 - BetterBench's prefill sweep on four slots: 12k / 24k / 47k tokens 961 / 915 / 830 tok/s, against 920 / 836 / 716 on
-  two slots before; its concurrency sweep 154 tok/s with four requests in flight and 152 with eight.
+  two slots before; its concurrency sweep 154 tok/s with four requests in flight.
 
 ## Known limits
 
