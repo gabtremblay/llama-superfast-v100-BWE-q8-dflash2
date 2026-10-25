@@ -347,6 +347,10 @@ slot added nothing (93 vs 93 tok/s combined).
 
 - The generating slots share a budget of verify rows, 8 up to two slots and 16 from three (`LLAMA_SPEC_WIDTH_SLOTS=8,16`):
   each drafts `budget / generating − 1` tokens, so two slots keep 7, three draft 4 and four draft 3.
+- A slot alone always drafts the full 7. The older adaptive policy, which narrowed the draft to 3 tokens when its cost
+  table said a wide verify was too dear, is off by default (`LLAMA_SPEC_ADAPT_WIDTH=1` turns it back on): its table
+  predates the streaming verify kernel, which reads the cache once a step whatever the width. On a 148k-token
+  conversation it drafted 3 tokens most rounds for 52 tok/s; the full width at the same depth gives 80–113 tok/s.
 - The DFlash2 draft graph needs equal block widths in one ubatch, so the draft now runs one width at a time when slots
   draft different widths. Before, a narrowed slot beside full ones mis-blocked silently at two slots and asserted at
   three.

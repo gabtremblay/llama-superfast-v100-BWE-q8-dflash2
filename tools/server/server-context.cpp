@@ -453,11 +453,16 @@ struct server_slot {
     // (7.2 ms at short depth, 11.8 at 64K, 15.6 at 96K, measured), and 6 rows cost what 8 do, so the choice is between the full width
     // and the 4-row width (3 drafted): the full width when its expected tokens per millisecond are at least the narrow one's.
     // ada_acc[i] is a moving average of P(more than i drafted tokens accepted), updated at every drafted position of every round.
+    // OFF unless LLAMA_SPEC_ADAPT_WIDTH=1 since 2026-10-25: the cost table below predates the streaming verify kernel, which reads
+    // the cache once a step whatever the width. On a 148k-token conversation it cost 8-row steps 56 ms and 4-row steps 54 ms, the
+    // table says 70 vs 55, and the policy drafted 3 tokens most rounds: 2.9 tokens a step and 52 tok/s; the full width at the
+    // same depth gave 4.1-5.7 tokens a step and 80-113 tok/s. The table needs remeasuring (or the round timers) before this
+    // comes back on.
     std::vector<float> ada_acc;
     int32_t ada_round = 0;
 
     static bool ada_on() {
-        static const bool on = [] { const char * e = getenv("LLAMA_SPEC_ADAPT_WIDTH"); return e == nullptr || atoi(e) != 0; }();
+        static const bool on = [] { const char * e = getenv("LLAMA_SPEC_ADAPT_WIDTH"); return e != nullptr && atoi(e) != 0; }();
         return on;
     }
 
