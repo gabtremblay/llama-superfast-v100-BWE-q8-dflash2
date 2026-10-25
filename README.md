@@ -156,6 +156,11 @@ What the settings do:
 - 245,760 tokens with four slots peaks at ~32.3 GB. VRAM keeps growing for the first minutes of real traffic, so size a
   different context from a long mixed run, not a fill test (section 5).
 
+The host side of this setup — powering an OcuLink eGPU dock from a USB relay, training the PCIe link through an S3
+suspend, loading the driver with the 200 W cap, and cooling the passive card with a PWM fan driven from its
+temperature, as systemd units an inference service chains after — is published separately as
+[v100-egpu-host](https://github.com/gabtremblay/v100-egpu-host), with the bill of materials.
+
 Check the startup log for `two-user scheduling (LLAMA_TU): on`, the draft model loading, and
 `n_slots = 4, n_ctx_slot = 245760`. Draft acceptance on this target is ~0.5; near zero means the draft did not load.
 
