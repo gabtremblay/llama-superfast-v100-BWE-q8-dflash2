@@ -2862,6 +2862,46 @@ void llama_context::rs_replay_pending(const llama_batch & b) {
             if (k < 0) {
                 continue;
             }
+            // LLAMA_RS_REPLAY_SELFTEST=1: before the rollback, replay the whole last ubatch into the scratch row and compare it
+            // with the live row, layer by layer (the replay of all its tokens must reproduce the state exactly)
+            static const bool selftest = getenv("LLAMA_RS_REPLAY_SELFTEST") != nullptr;
+            if (selftest) {
+                const int32_t  cell = recr->seq_cell(s);
+                const uint32_t m    = cell >= 0 ? std::min<uint32_t>(recr->cells[cell].n_last, recr->rs_replay) : 0;
+                if (m >= 1 && rs_replay(s, m, recr->rs_scratch_row)) {
+                    synchronize();
+                    int n_bad = 0, first_bad = -1;
+                    float max_diff = 0.0f;
+                    for (size_t il = 0; il < recr->s_l.size(); ++il) {
+                        for (ggml_tensor * t : { recr->r_l[il], recr->s_l[il] }) {
+                            if (t == nullptr) {
+                                continue;
+                            }
+                            const size_t n = (size_t) t->ne[0];
+                            std::vector<float> a(n), b(n);
+                            ggml_backend_tensor_get(t, a.data(), (size_t) cell * t->nb[1], n*sizeof(float));
+                            ggml_backend_tensor_get(t, b.data(), (size_t) recr->rs_scratch_row * t->nb[1], n*sizeof(float));
+                            float d = 0.0f;
+                            for (size_t i = 0; i < n; ++i) {
+                                d = std::max(d, std::fabs(a[i] - b[i]));
+                            }
+                            if (d > 0.0f) {
+                                n_bad++;
+                                if (first_bad < 0) {
+                                    first_bad = (int) il;
+                                }
+                                max_diff = std::max(max_diff, d);
+                            }
+                        }
+                    }
+                    LLAMA_LOG_WARN("rs replay selftest: seq %d, %u tokens replayed: %s (%d tensors differ, first layer %d, max |diff| %g)
+",
+                            s, m, n_bad == 0 ? "IDENTICAL" : "DIFFERENT", n_bad, first_bad, (double) max_diff);
+                } else {
+                    LLAMA_LOG_WARN("rs replay selftest: seq %d: no replay (m %u)
+", s, m);
+                }
+            }
             const int64_t t0 = ggml_time_us();
             bool ok;
             if (k == 0) {
