@@ -2946,6 +2946,7 @@ void llama_context::rs_replay_pending(const llama_batch & b) {
                 GGML_ABORT("[TAG_RS_REPLAY] the replay of %d tokens for sequence %d failed", k, s);
             }
             recr->rs_replay_done(s);
+            ggml_rt_label(this, (int) b.n_tokens);
             if (selftest) {
                 synchronize();
                 for (size_t il = 0; il < recr->s_l.size(); ++il) {
@@ -3027,6 +3028,7 @@ bool llama_context::rs_replay(llama_seq_id seq_id, uint32_t k, uint32_t dst_row)
 
     ggml_status st = GGML_STATUS_SUCCESS;
     rs_replay_active = true;
+    ggml_rt_label(this, 100 + (int) k); // the round timers: replay graphs apart from the decode's (c0/10k)
     llm_graph_result * res = process_ubatch(ub, LLM_GRAPH_TYPE_RS_REPLAY, &rctx, st);
     rs_replay_active = false;
 

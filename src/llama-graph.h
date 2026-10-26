@@ -308,6 +308,7 @@ public:
     bool          replay_graph = false;
     ggml_tensor * ring_idx     = nullptr;
     ggml_tensor * replay_dst   = nullptr; // I32 [1]: the row a replay graph writes (an input, so the graph is reusable)
+    ggml_tensor * replay_rows  = nullptr; // I32 [k]: the ring rows a replay graph reads (seq*rs_replay + j)
 
     const llama_memory_recurrent_context * mctx;
 

@@ -803,11 +803,12 @@ void llama_model_qwen35::graph::build_layer_rs_replay(llm_graph_input_rs * inp, 
     ggml_tensor * g_all = mctx_cur->get_g_l(il);
     ggml_tensor * b_all = mctx_cur->get_b_l(il);
     GGML_ASSERT(x_all != nullptr && g_all != nullptr && b_all != nullptr);
-    const size_t row0 = (size_t) seq * M;
-
-    ggml_tensor * qkv_mixed = ggml_view_3d(ctx0, x_all, x_all->ne[0], k, 1, x_all->nb[1], (size_t) k * x_all->nb[1], row0 * x_all->nb[1]);
-    ggml_tensor * gate      = ggml_view_4d(ctx0, g_all, 1, num_v_heads, k, 1, g_all->nb[0], g_all->nb[1], (size_t) k * g_all->nb[1], row0 * g_all->nb[1]);
-    ggml_tensor * beta      = ggml_view_4d(ctx0, b_all, 1, num_v_heads, k, 1, b_all->nb[0], b_all->nb[1], (size_t) k * b_all->nb[1], row0 * b_all->nb[1]);
+    GGML_UNUSED(seq);
+    // the rows through the input table, so the graph holds nothing of the sequence and is reused for every one
+    GGML_ASSERT(inp->replay_rows != nullptr && inp->replay_rows->ne[0] == k);
+    ggml_tensor * qkv_mixed = ggml_reshape_3d(ctx0, ggml_get_rows(ctx0, x_all, inp->replay_rows), x_all->ne[0], k, 1);
+    ggml_tensor * gate      = ggml_reshape_4d(ctx0, ggml_get_rows(ctx0, g_all, inp->replay_rows), 1, num_v_heads, k, 1);
+    ggml_tensor * beta      = ggml_reshape_4d(ctx0, ggml_get_rows(ctx0, b_all, inp->replay_rows), 1, num_v_heads, k, 1);
     cb(qkv_mixed, "rs_replay_qkv_mixed", il);
 
     ggml_tensor * conv_states_all = mctx_cur->get_r_l(il);
