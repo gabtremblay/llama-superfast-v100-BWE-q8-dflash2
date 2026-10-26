@@ -355,7 +355,7 @@ void llm_graph_input_rs::set_input(const llama_ubatch * ubatch) {
     if (replay_rows) {
         GGML_ASSERT(ggml_backend_buffer_is_host(replay_rows->buffer) && replay_rows->ne[0] == (int64_t) ubatch->n_seq_tokens);
         int32_t * data = (int32_t *) replay_rows->data;
-        const llama_seq_id seq = ubatch->seq_id[0][0];
+        const llama_seq_id seq = mctx->get_replay_seq(); // the ubatch names sequence 0 whichever one replays, for reuse
         for (uint32_t j = 0; j < ubatch->n_seq_tokens; ++j) {
             data[j] = (int32_t) (seq*rs_replay + j);
         }

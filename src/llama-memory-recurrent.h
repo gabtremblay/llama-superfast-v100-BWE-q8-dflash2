@@ -266,8 +266,9 @@ public:
     uint32_t      get_rs_replay() const;
     bool          is_replay() const { return replay; }
     uint32_t      get_replay_dst() const { return replay_dst; }
+    llama_seq_id  get_replay_seq() const { return replay_seq; }
     // a replay graph's context: one state written at head_row, read from src_row; no ubatch, apply() changes nothing
-    llama_memory_recurrent_context(llama_memory_recurrent * mem, uint32_t head_row, uint32_t src_row);
+    llama_memory_recurrent_context(llama_memory_recurrent * mem, uint32_t head_row, uint32_t src_row, llama_seq_id seq);
 
     int32_t s_copy(int i) const;
 
@@ -297,6 +298,7 @@ private:
 
     bool     replay     = false; // [TAG_RS_REPLAY]
     uint32_t replay_dst = 0;     // the row a replay graph writes (its head stays 0: the row is an input)
+    llama_seq_id replay_seq = 0; // the sequence whose ring a replay graph reads (an input too)
 
     const llama_memory_status status;
 

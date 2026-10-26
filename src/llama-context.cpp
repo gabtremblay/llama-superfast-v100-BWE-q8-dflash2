@@ -2977,16 +2977,22 @@ bool llama_context::rs_replay(llama_seq_id seq_id, uint32_t k, uint32_t dst_row)
     if (recr == nullptr || recr->rs_replay == 0 || k == 0 || k > recr->rs_replay || seq_id < 0 || seq_id >= LLAMA_MAX_SEQ) {
         return false;
     }
-    // the ubatch: k tokens of the sequence (their ids and positions are not read)
-    rs_ub_tok.assign(k, 0);
-    rs_ub_pos.assign(k, 0);
-    rs_ub_nseq.assign(k, 1);
-    rs_ub_seq = seq_id;
-    rs_ub_seqp.assign(k, &rs_ub_seq);
-    rs_ub_unq.assign(1, seq_id);
-    rs_ub_seqidx.assign(LLAMA_MAX_SEQ, -1);
-    rs_ub_seqidx[seq_id] = 0;
-    rs_ub_out.assign(k, 0);
+    // the ubatch: k tokens, owning its data (the graph reuse check wants that) and naming sequence 0 whichever sequence
+    // replays: the sequence reaches the graph through the context's inputs (the ring rows, the kept row, the written row),
+    // so one graph a length serves every sequence
+    auto d = std::make_shared<llama_ubatch::data_t>();
+    d->token.assign(k, 0);
+    d->pos.assign(k, 0);
+    d->n_seq_id.assign(k, 1);
+    d->seq_id_data.assign(k, 0);
+    d->seq_id.resize(k);
+    for (uint32_t i = 0; i < k; ++i) {
+        d->seq_id[i] = &d->seq_id_data[i];
+    }
+    d->seq_id_unq.assign(1, 0);
+    d->seq_idx.assign(LLAMA_MAX_SEQ, -1);
+    d->seq_idx[0] = 0;
+    d->output.assign(k, 0);
     llama_ubatch ub = {};
     ub.b_equal_seqs = 1;
     ub.n_tokens     = k;
@@ -2994,16 +3000,17 @@ bool llama_context::rs_replay(llama_seq_id seq_id, uint32_t k, uint32_t dst_row)
     ub.n_seqs       = 1;
     ub.n_seqs_unq   = 1;
     ub.n_pos        = 1;
-    ub.token        = rs_ub_tok.data();
+    ub.token        = d->token.data();
     ub.embd         = nullptr;
-    ub.pos          = rs_ub_pos.data();
-    ub.n_seq_id     = rs_ub_nseq.data();
-    ub.seq_id       = rs_ub_seqp.data();
-    ub.seq_id_unq   = rs_ub_unq.data();
-    ub.seq_idx      = rs_ub_seqidx.data();
-    ub.output       = rs_ub_out.data();
+    ub.pos          = d->pos.data();
+    ub.n_seq_id     = d->n_seq_id.data();
+    ub.seq_id       = d->seq_id.data();
+    ub.seq_id_unq   = d->seq_id_unq.data();
+    ub.seq_idx      = d->seq_idx.data();
+    ub.output       = d->output.data();
+    ub.data         = d;
 
-    llama_memory_recurrent_context rctx(recr, dst_row, recr->rs_bak_row(seq_id));
+    llama_memory_recurrent_context rctx(recr, dst_row, recr->rs_bak_row(seq_id), seq_id);
 
     // one scheduler and graph result a replay length: a length's graph stays allocated, and its second run on is
     // set_inputs and compute (the row it writes and the row it reads are inputs), under a CUDA graph
