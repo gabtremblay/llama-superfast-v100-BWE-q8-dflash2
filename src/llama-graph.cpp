@@ -376,7 +376,6 @@ void llm_graph_input_rs::set_input(const llama_ubatch * ubatch) {
         }
     }
 }
-}
 
 
 // [TAG_RS_REPLAY] the ring rows of each sequence's last ring_m tokens (the hybrid inputs fill s_copy themselves and call this)
