@@ -669,6 +669,7 @@ private:
     std::vector<llm_graph_result_ptr>   gf_res_rs_k;
     std::vector<llm_graph_result *>     gf_res_rs_active_k;
     bool                                rs_replay_active = false; // a replay graph is being processed: no device syncs for it
+    bool                                rs_replay_last_reused = false;
     llm_graph_result *     gf_res_override    = nullptr;
     int64_t                rs_replay_n        = 0;
     int64_t                rs_replay_us       = 0;

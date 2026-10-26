@@ -2964,7 +2964,7 @@ void llama_context::rs_replay_pending(const llama_batch & b) {
             rs_replay_n  += 1;
             rs_replay_us += dt;
             if (rlog) {
-                LLAMA_LOG_WARN("rs replay: seq %d, %d tokens, %.2f ms (%lld replays, %.2f ms mean)\n", s, k, dt/1000.0,
+                LLAMA_LOG_WARN("rs replay: seq %d, %d tokens, %.2f ms %s (%lld replays, %.2f ms mean)\n", s, k, dt/1000.0, k == 0 ? "copy" : rs_replay_last_reused ? "reused" : "REBUILT",
                         (long long) rs_replay_n, rs_replay_us/1000.0/std::max<int64_t>(1, rs_replay_n));
             }
         }
@@ -3028,9 +3028,11 @@ bool llama_context::rs_replay(llama_seq_id seq_id, uint32_t k, uint32_t dst_row)
 
     ggml_status st = GGML_STATUS_SUCCESS;
     rs_replay_active = true;
+    const int32_t n_reused0 = n_reused;
     ggml_rt_label(this, 100 + (int) k); // the round timers: replay graphs apart from the decode's (c0/10k)
     llm_graph_result * res = process_ubatch(ub, LLM_GRAPH_TYPE_RS_REPLAY, &rctx, st);
     rs_replay_active = false;
+    rs_replay_last_reused = n_reused > n_reused0;
 
     n_outputs = n_outputs_save;
     gf_res_override = nullptr;
