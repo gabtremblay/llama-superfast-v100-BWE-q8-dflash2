@@ -891,6 +891,53 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
         if (max < seq_meta.tail) { max = seq_meta.tail; }
     }
 
+    // [TAG_RS_LOCK_RANGE] the gather below moves the ubatch's cells into [min, min + n_seqs): never over a locked cell (a
+    // prompt job's, rs_lock, whose groups keep writing that storage cell between the other sequences' decodes; the next
+    // decode would copy another sequence's state over it, and the job's hash check aborts). With the spare cell
+    // ([TAG_RS_SPARE]) a run of n_seqs cells beside the locked one exists; the cells in its way go to the ubatch
+    // sequences' old places
+    {
+        auto locked_in = [&](int32_t lo) {
+            for (uint32_t s = 0; s < rs_lock.size(); ++s) {
+                if (!rs_lock[s] || s >= size) {
+                    continue;
+                }
+                const int32_t t = cells[s].tail;
+                if (t < lo || t >= lo + (int32_t) n_seqs) {
+                    continue;
+                }
+                bool in_ubatch = false;
+                for (uint32_t u = 0; u < n_seqs && !in_ubatch; ++u) {
+                    in_ubatch = ubatch.seq_id[u*n_seq_tokens][0] == (llama_seq_id) s;
+                }
+                if (!in_ubatch) {
+                    return true;
+                }
+            }
+            return false;
+        };
+        if (locked_in(min)) {
+            int32_t pick = -1;
+            for (int32_t lo = 0; lo + (int32_t) n_seqs <= (int32_t) size; ++lo) {
+                if (!locked_in(lo)) {
+                    pick = lo;
+                    break;
+                }
+            }
+            if (pick < 0) {
+                LLAMA_LOG_ERROR("%s: no run of %u cells beside a prompt job's cell (%u cells; LLAMA_RS_SPARE=0?)\n", __func__, n_seqs, size);
+                return false;
+            }
+            static const bool rlog = getenv("LLAMA_RS_POOL_LOG") != nullptr;
+            if (rlog) {
+                LLAMA_LOG_WARN("%s: %u sequences gathered at cells %d..%d, beside a prompt job's cell (cells %d..%d held it)\n",
+                        __func__, n_seqs, pick, pick + (int32_t) n_seqs - 1, min, min + (int32_t) n_seqs - 1);
+            }
+            min = pick;
+            max = std::max(max, pick + (int32_t) n_seqs - 1);
+        }
+    }
+
     // gather and re-order
     for (uint32_t s = 0; s < n_seqs; ++s) {
         const uint32_t i = s*n_seq_tokens;

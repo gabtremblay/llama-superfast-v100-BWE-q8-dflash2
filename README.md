@@ -396,6 +396,11 @@ a depth of 3 made a lone slot draft 3 as well (decode 74–82 tok/s instead of 9
   and four 3. The runs are planned when the set of active slots changes, and a snapshot still to be read is applied to
   the live row before its run moves. Four live rows and 12 shared ones are 2.4 GB, the same as two slots before, so
   four slots fit the 245,760-token pool.
+- A fifth live cell (`LLAMA_RS_SPARE=0` drops it, 150 MiB) keeps a prompt job's state where it is: llama.cpp gathers
+  the cells of the sequences decoding together into one run by swapping cells, and with a cell a slot, three slots
+  decoding while the fourth held a prompt job swapped the job's cell into their run, and the next decode copied another
+  slot's state over it (the job's row check aborted the server about one run of the 8-in-flight probe in three). The
+  gather now takes a run beside a job's cell.
 - The graph writes each sequence's snapshots as a copy of its own (the fused GDN cache write takes per-sequence bases),
   and the snapshot rows belong to the sequence, not to the storage cell: `f8aaffa` fixed a lookup through the cell,
   which read another sequence's snapshot once the cache had moved a sequence's state (three pinned slots generating
@@ -432,8 +437,8 @@ of section 11 skipped those prefixes (its 1,024-cell cap).
   only.
 - Combined decode tops out near 130–160 tok/s with four slots: a verify step costs about the same up to 8 rows, so the
   slots share 16 verify rows a step (section 12), and each slot drafts less when more generate.
-- Four slots at 245,760 tokens use ~32.3 GB of the card's 32.5: no room for a fifth slot or a larger pool. The
-  recurrent rows alone are 150 MiB each (section 13).
+- Four slots at 245,760 tokens use ~32.4 GB of the card's 32.5: no room for a fifth slot or a larger pool. The
+  recurrent rows alone are 150 MiB each (section 13); the spare cell of section 13 is one of them.
 - The first two prompts after a start pay ~0.4 s once each to allocate a device checkpoint copy.
 - Two or more cards (`--split-mode tensor`) are supported by code reading only (the section after `## Run`): nothing
   here has run on more than one card.

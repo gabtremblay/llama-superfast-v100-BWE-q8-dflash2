@@ -2422,6 +2422,15 @@ ggml_tensor * llama_model::get_rope_factors(const llama_cparams & cparams, int i
     return layers[il].rope_short;
 }
 
+// [TAG_RS_SPARE] the recurrent cells for n_seq_max sequences: one spare when there are several
+static uint32_t llama_rs_cells(uint32_t n_seq_max) {
+    static const bool spare = [] {
+        const char * e = getenv("LLAMA_RS_SPARE");
+        return e == nullptr || atoi(e) != 0;
+    }();
+    return n_seq_max > 1 && spare ? n_seq_max + 1 : std::max((uint32_t) 1, n_seq_max);
+}
+
 llama_memory_i * llama_model::create_memory(const llama_memory_params & params, const llama_cparams & cparams) const {
     llama_memory_i * res;
 
@@ -2822,7 +2831,11 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             /* attn_swa_type     */ hparams.swa_type,
                             /* recurrent_type_k  */ GGML_TYPE_F32,
                             /* recurrent_type_v  */ GGML_TYPE_F32,
-                            /* recurrent_kv_size */ std::max((uint32_t) 1, cparams.n_seq_max),
+                            // [TAG_RS_SPARE] one cell more than the sequences (LLAMA_RS_SPARE=0: none): a prompt job's cell
+                            // stays put while the other sequences' cells are gathered beside it (llama_memory_recurrent::
+                            // find_slot). With a cell a sequence, three of four decoding together had to swap the fourth's
+                            // cell into their run, and the next decode copied another state over the job's rows
+                            /* recurrent_kv_size */ llama_rs_cells(cparams.n_seq_max),
                             /* n_seq_max         */ cparams.n_seq_max,
                             /* n_rs_seq          */ cparams.n_rs_seq,
                             /* offload           */ cparams.offload_kqv,
@@ -2842,7 +2855,11 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             /* attn_swa_type     */ hparams.swa_type,
                             /* recurrent_type_k  */ GGML_TYPE_F32,
                             /* recurrent_type_v  */ GGML_TYPE_F32,
-                            /* recurrent_kv_size */ std::max((uint32_t) 1, cparams.n_seq_max),
+                            // [TAG_RS_SPARE] one cell more than the sequences (LLAMA_RS_SPARE=0: none): a prompt job's cell
+                            // stays put while the other sequences' cells are gathered beside it (llama_memory_recurrent::
+                            // find_slot). With a cell a sequence, three of four decoding together had to swap the fourth's
+                            // cell into their run, and the next decode copied another state over the job's rows
+                            /* recurrent_kv_size */ llama_rs_cells(cparams.n_seq_max),
                             /* n_seq_max         */ cparams.n_seq_max,
                             /* n_rs_seq          */ cparams.n_rs_seq,
                             /* offload           */ cparams.offload_kqv,
