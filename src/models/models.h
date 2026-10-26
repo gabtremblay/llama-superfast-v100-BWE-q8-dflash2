@@ -89,6 +89,9 @@ struct llm_build_delta_net_base : public llm_graph_context {
     // [TAG_RS_POOL] the rollback slots a ubatch's graph writes (slot 0 the live state): 1 + n_rs_seq, or with the shared snapshot
     // pool 1 + the smallest depth of the ubatch's sequences
     int64_t rs_n_slots(const llm_graph_input_rs * inp) const;
+
+    // [TAG_RS_REPLAY] the last ring_m tokens of src ([C, n_seq_tokens, n_seqs]) of each sequence to its ring rows
+    void build_rs_ring_write(llm_graph_input_rs * inp, ggml_tensor * ring, ggml_tensor * src, int il);
     // the write of rollback slot `slot` of a recurrent state tensor for the ubatch's n_seqs sequences: src [row_elems, n_seqs]
     // (any strides). Slot 0 goes to the live rows at the head; the others to the uniform layout's rows (slot*mem_size + head)
     // or the pool's: one strided view when the sequences' runs are at one stride, else a set_rows with each row named
@@ -2517,6 +2520,10 @@ struct llama_model_qwen35 : public llama_model_base {
         std::pair<ggml_tensor *, ggml_tensor *> build_qkvz(
                     ggml_tensor * input,
                             int   il);
+
+        // [TAG_RS_REPLAY] a rollback's replay graph: the recurrent layers, from the ubatch's sequence's ring and kept state
+        void build_rs_replay();
+        void build_layer_rs_replay(llm_graph_input_rs * inp, llama_seq_id seq, int64_t k, int il);
 
         // under --split-mode tensor, a prefill ubatch as two halves interleaved layer by layer (two-batch overlap)
         bool tbo_applies() const;

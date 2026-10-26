@@ -2737,6 +2737,10 @@ extern "C" {
     // the output packs the attention scores [S_v, H_v, n_tokens, n_seqs] followed by K state
     // snapshots, most-recent first (slot 0 = final state, slot s = state s tokens back). K == 1
     // keeps only the final state; when n_tokens < K only slots 0..n_tokens-1 are written.
+    // [TAG_RS_REPLAY] with n > 0 (and K == 2), slot 1 of the output holds the state min(n_tokens, n) tokens back (the initial
+    // state when the ubatch is shorter) instead of the state one token back
+    GGML_API void ggml_gated_delta_net_set_snap_back(struct ggml_tensor * a, int32_t n);
+
     GGML_API struct ggml_tensor * ggml_gated_delta_net(
             struct ggml_context * ctx,
             struct ggml_tensor  * q,

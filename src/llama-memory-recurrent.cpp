@@ -91,6 +91,26 @@ llama_memory_recurrent::llama_memory_recurrent(
     rs_snapbase.assign(n_seq_max, 0);
     rs_lock.assign(n_seq_max, 0);
 
+    // [TAG_RS_REPLAY]
+    {
+        const char * e = getenv("LLAMA_RS_REPLAY");
+        if (e != nullptr && atoi(e) != 0 && n_rs_seq > 0) {
+            rs_replay = std::max<uint32_t>((uint32_t) std::max(0, atoi(e)), n_rs_seq + 1);
+            if (n_rs_bak > 0) {
+                LLAMA_LOG_WARN("%s: LLAMA_RS_REPLAY does not combine with pipelined speculation (LLAMA_SPEC_PIPELINE): replay is off\n", __func__);
+                rs_replay = 0;
+            }
+        }
+        if (rs_replay > 0) {
+            rs_pool = n_seq_max; // one kept state a sequence, in the pool's row seq
+            rs_depth.assign(n_seq_max, 1);
+            for (uint32_t s = 0; s < n_seq_max; ++s) {
+                rs_snapbase[s] = s;
+            }
+            rs_view_row.assign(n_seq_max, -1);
+        }
+    }
+
     cells.clear();
     cells.resize(mem_size);
 
@@ -108,7 +128,7 @@ llama_memory_recurrent::llama_memory_recurrent(
         if (it == ctx_map.end()) {
             ggml_init_params params = {
                 // r and s per layer, plus the separate PLE conv row where the model has one
-                /*.mem_size   =*/ size_t((hparams.ple_conv_state() > 0 ? 3u : 2u)*n_layer*ggml_tensor_overhead()),
+                /*.mem_size   =*/ size_t(((hparams.ple_conv_state() > 0 ? 3u : 2u) + (rs_replay > 0 ? 3u : 0u))*n_layer*ggml_tensor_overhead()),
                 /*.mem_buffer =*/ NULL,
                 /*.no_alloc   =*/ true,
             };
@@ -129,6 +149,9 @@ llama_memory_recurrent::llama_memory_recurrent(
     r_l.resize(n_layer);
     s_l.resize(n_layer);
     p_l.resize(n_layer);
+    x_l.resize(n_layer);
+    g_l.resize(n_layer);
+    b_l.resize(n_layer);
 
     for (int i = 0; i < n_layer; i++) {
         if (filter && !filter(i)) {
@@ -154,13 +177,25 @@ llama_memory_recurrent::llama_memory_recurrent(
             throw std::runtime_error("failed to create ggml context for rs cache");
         }
 
-        const uint32_t n_rows = rs_pool > 0 ? mem_size + rs_pool : mem_size * (1 + n_rs_seq + n_rs_bak);
+        const uint32_t n_rows = (rs_pool > 0 ? mem_size + rs_pool : mem_size * (1 + n_rs_seq + n_rs_bak)) + (rs_replay > 0 ? 1 : 0);
+        rs_scratch_row = mem_size + rs_pool; // [TAG_RS_REPLAY] the last row
         ggml_tensor * r = ggml_new_tensor_2d(ctx, type_r, hparams.n_embd_r(), n_rows);
         ggml_tensor * s = ggml_new_tensor_2d(ctx, type_s, hparams.n_embd_s(), n_rows);
         ggml_format_name(r, "cache_r_l%d", i);
         ggml_format_name(s, "cache_s_l%d", i);
         r_l[i] = r;
         s_l[i] = s;
+        // [TAG_RS_REPLAY] the input rings of the last rs_replay tokens a sequence
+        if (rs_replay > 0) {
+            const int64_t C  = hparams.ssm_d_inner + 2*hparams.ssm_n_group*hparams.ssm_d_state;
+            const int64_t Hv = hparams.ssm_dt_rank;
+            x_l[i] = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, C,  (int64_t) rs_replay*n_seq_max);
+            g_l[i] = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, Hv, (int64_t) rs_replay*n_seq_max);
+            b_l[i] = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, Hv, (int64_t) rs_replay*n_seq_max);
+            ggml_format_name(x_l[i], "rs_ring_x_l%d", i);
+            ggml_format_name(g_l[i], "rs_ring_g_l%d", i);
+            ggml_format_name(b_l[i], "rs_ring_b_l%d", i);
+        }
 
         // the PLE history needs its own row: Meta must mirror it while the delta-net conv state next door stays split
         if (hparams.ple_conv_state() > 0 && hparams.is_ple(i)) {
@@ -191,7 +226,10 @@ llama_memory_recurrent::llama_memory_recurrent(
                 ggml_type_name(type_r), (float)memory_size_r / (1024.0f * 1024.0f),
                 ggml_type_name(type_s), (float)memory_size_s / (1024.0f * 1024.0f),
                 ggml_type_name(type_r), (float)memory_size_p / (1024.0f * 1024.0f));
-        if (rs_pool > 0) {
+        if (rs_replay > 0) {
+            LLAMA_LOG_INFO("%s: rollback by replay (LLAMA_RS_REPLAY): the state %u tokens back and the last %u tokens' inputs kept a sequence, %u rows + 1 scratch, no snapshot pool\n",
+                    __func__, rs_replay, rs_replay, rs_pool);
+        } else if (rs_pool > 0) {
             LLAMA_LOG_INFO("%s: rollback snapshot pool (LLAMA_RS_POOL): %u rows shared by %u sequences, at most %u a sequence\n",
                     __func__, rs_pool, n_seq_max, n_rs_seq);
         }
@@ -502,6 +540,17 @@ bool llama_memory_recurrent::rs_view_back(llama_seq_id seq_id, int32_t n_back) {
         rs_view_pos.resize(n_seq_max, -1);
     }
     rs_view_pos[seq_id] = cell.pos;
+    if (rs_replay > 0) {
+        // [TAG_RS_REPLAY] the view reads a replay of the last ubatch up to n_back tokens before its end, in the scratch row
+        const uint32_t m = std::min<uint32_t>(cell.n_last, rs_replay);
+        if ((uint32_t) n_back > m || !rs_replay_fn || !rs_replay_fn(seq_id, m - (uint32_t) n_back, rs_scratch_row)) {
+            rs_view_pos[seq_id] = -1;
+            return false;
+        }
+        rs_view_row[seq_id] = (int32_t) rs_scratch_row;
+        cell.pos -= n_back;
+        return true;
+    }
     cell.pos -= n_back;
     rs_idx[seq_id] = (uint32_t) n_back;
     return true;
@@ -517,6 +566,9 @@ void llama_memory_recurrent::rs_view_end(llama_seq_id seq_id) {
     }
     rs_idx[seq_id]      = 0;
     rs_view_pos[seq_id] = -1;
+    if ((size_t) seq_id < rs_view_row.size()) {
+        rs_view_row[seq_id] = -1; // [TAG_RS_REPLAY]
+    }
 }
 
 void llama_memory_recurrent::set_rs_idx(llama_seq_id seq_id, uint32_t idx) {
@@ -535,7 +587,7 @@ void llama_memory_recurrent::set_rs_idx(llama_seq_id seq_id, uint32_t idx) {
 
 // [TAG_RS_POOL]
 uint32_t llama_memory_recurrent::get_rs_depth(llama_seq_id seq_id) const {
-    if (rs_pool == 0) {
+    if (rs_pool == 0 || rs_replay > 0) { // [TAG_RS_REPLAY] a rollback of up to n_rs_seq tokens replays
         return n_rs_seq;
     }
     return seq_id >= 0 && (size_t) seq_id < rs_depth.size() ? rs_depth[seq_id] : 0;
@@ -554,11 +606,51 @@ uint32_t llama_memory_recurrent::rs_row(uint32_t idx, llama_seq_id seq, uint32_t
 // a rollback snapshot still to be read (rs_idx) is applied now: it goes to the live row, which the next decode then reads as
 // s_copy would have read the snapshot (the caller synchronized the device), so the sequence's run is free to move
 void llama_memory_recurrent::rs_apply_pending(llama_seq_id seq_id) {
-    if (seq_id < 0 || (size_t) seq_id >= rs_idx.size() || rs_idx[seq_id] == 0 || rs_idx[seq_id] > n_rs_seq) {
+    if (rs_replay > 0 || seq_id < 0 || (size_t) seq_id >= rs_idx.size() || rs_idx[seq_id] == 0 || rs_idx[seq_id] > n_rs_seq) {
         return;
     }
     const int32_t tail = (uint32_t) seq_id < size ? cells[seq_id].tail : -1;
     if (tail >= 0 && cells[tail].has_seq_id(seq_id)) {
+        rs_copy_row_to_live(seq_id, rs_row(rs_idx[seq_id], seq_id, (uint32_t) tail));
+    }
+    rs_idx[seq_id] = 0;
+}
+
+// [TAG_RS_REPLAY]
+int32_t llama_memory_recurrent::rs_replay_pending(llama_seq_id seq_id) const {
+    if (rs_replay == 0 || seq_id < 0 || (size_t) seq_id >= rs_idx.size() || rs_idx[seq_id] == 0) {
+        return -1;
+    }
+    const int32_t tail = seq_cell(seq_id);
+    if (tail < 0) {
+        return -1;
+    }
+    const uint32_t m   = std::min<uint32_t>(cells[tail].n_last, rs_replay);
+    const uint32_t idx = rs_idx[seq_id];
+    GGML_ASSERT(idx <= m && "a rollback past the last ubatch's kept tokens");
+    return (int32_t) (m - idx);
+}
+
+void llama_memory_recurrent::rs_replay_done(llama_seq_id seq_id) {
+    if (seq_id < 0 || (size_t) seq_id >= rs_idx.size()) {
+        return;
+    }
+    if (rs_idx_seen[seq_id] < 0) {
+        rs_idx_seen[seq_id] = (int32_t) rs_idx[seq_id];
+    }
+    rs_idx[seq_id] = 0;
+}
+
+bool llama_memory_recurrent::rs_copy_kept(llama_seq_id seq_id) {
+    return rs_copy_row_to_live(seq_id, rs_bak_row(seq_id));
+}
+
+bool llama_memory_recurrent::rs_copy_row_to_live(llama_seq_id seq_id, uint32_t row_src) {
+    const int32_t tail = seq_cell(seq_id);
+    if (tail < 0 || !cells[tail].has_seq_id(seq_id)) {
+        return false;
+    }
+    {
         const size_t n_views = 2*3*r_l.size()*rs_n_dev(r_l, s_l);
         if (!bak_view_ctx || ggml_get_mem_size(bak_view_ctx.get()) < n_views*ggml_tensor_overhead()) {
             ggml_init_params ip = { n_views*ggml_tensor_overhead(), nullptr, true };
@@ -567,7 +659,6 @@ void llama_memory_recurrent::rs_apply_pending(llama_seq_id seq_id) {
             ggml_reset(bak_view_ctx.get());
         }
         ggml_context * vctx = bak_view_ctx.get();
-        const uint32_t row_src = rs_row(rs_idx[seq_id], seq_id, (uint32_t) tail);
         const uint32_t row_dst = (uint32_t) tail;
         auto copy_row = [&](ggml_tensor * t) {
             if (t == nullptr) {
@@ -587,13 +678,16 @@ void llama_memory_recurrent::rs_apply_pending(llama_seq_id seq_id) {
             copy_row(p_l[il]);
         }
     }
-    rs_idx[seq_id] = 0;
+    return true;
 }
 
 // the plan: locked sequences (a prompt job's) keep their runs; the others take their wanted depth in seq order, each run right
 // after the previous one when that is free (so sequences of one depth sit at one stride, the fused graph write), else the first
 // fit, a shorter run when none fits. Sequences whose run moves or shrinks below a pending snapshot have the snapshot applied first
 void llama_memory_recurrent::set_rs_depths(const std::vector<uint32_t> & want) {
+    if (rs_replay > 0) {
+        return; // [TAG_RS_REPLAY] one row a sequence, fixed
+    }
     if (rs_pool == 0) {
         return;
     }
@@ -675,6 +769,10 @@ void llama_memory_recurrent::set_rs_depths(const std::vector<uint32_t> & want) {
 }
 
 uint32_t llama_memory_recurrent::set_rs_depth(llama_seq_id seq_id, uint32_t depth) {
+    if (rs_replay > 0) {
+        GGML_UNUSED(seq_id); GGML_UNUSED(depth);
+        return 1; // [TAG_RS_REPLAY]
+    }
     if (rs_pool == 0 || seq_id < 0 || (size_t) seq_id >= rs_depth.size()) {
         return get_rs_depth(seq_id);
     }
@@ -1117,7 +1215,10 @@ void llama_memory_recurrent::state_write(llama_io_write_i & io, llama_seq_id seq
                 }
             }
 
-            const uint32_t cell_id = rs_row(rs_idx_cur, rs_seq, cell.src >= 0 ? (uint32_t) cell.src : i);
+            uint32_t cell_id = rs_row(rs_idx_cur, rs_seq, cell.src >= 0 ? (uint32_t) cell.src : i);
+            if (rs_replay > 0 && rs_seq >= 0 && (size_t) rs_seq < rs_view_row.size() && rs_view_row[rs_seq] >= 0) {
+                cell_id = (uint32_t) rs_view_row[rs_seq]; // [TAG_RS_REPLAY] a checkpoint's view: the replayed scratch row
+            }
             if (cell_ranges_data.empty() || cell_ranges_data.back().second != cell_id) {
                 cell_ranges_data.emplace_back(cell_id, cell_id + 1);
             } else {
@@ -1689,6 +1790,34 @@ ggml_tensor * llama_memory_recurrent_context::get_s_l(int32_t il) const {
     return mem->s_l[il];
 }
 
+// [TAG_RS_REPLAY]
+ggml_tensor * llama_memory_recurrent_context::get_x_l(int32_t il) const {
+    return mem->x_l[il];
+}
+
+ggml_tensor * llama_memory_recurrent_context::get_g_l(int32_t il) const {
+    return mem->g_l[il];
+}
+
+ggml_tensor * llama_memory_recurrent_context::get_b_l(int32_t il) const {
+    return mem->b_l[il];
+}
+
+uint32_t llama_memory_recurrent_context::get_rs_replay() const {
+    return mem->rs_replay;
+}
+
+llama_memory_recurrent_context::llama_memory_recurrent_context(llama_memory_recurrent * mem, uint32_t head_row, uint32_t src_row) :
+        status(LLAMA_MEMORY_STATUS_NO_UPDATE), mem(mem) {
+    replay     = true;
+    cap.on     = true;
+    cap.head   = head_row;
+    cap.n      = 1;
+    cap.rs_z   = -1;
+    cap.seq    = -1;
+    cap.s_copy = { (int32_t) src_row };
+}
+
 ggml_tensor * llama_memory_recurrent_context::get_p_l(int32_t il) const {
     return mem->p_l[il];
 }
@@ -1712,6 +1841,7 @@ int32_t llama_memory_recurrent_context::s_copy(int i) const {
         seq = *mem->cells[cell_idx].seq_id.begin();
         if (seq >= 0 && (size_t) seq < mem->rs_idx.size()) {
             idx = mem->rs_idx[seq];
+            GGML_ASSERT((mem->rs_replay == 0 || idx == 0) && "[TAG_RS_REPLAY] a pending rollback is replayed before the graph");
             // reset rollback idx
             mem->rs_idx[seq] = 0;
             if (mem->rs_idx_seen[seq] < 0) {
@@ -1731,6 +1861,9 @@ uint32_t llama_memory_recurrent_context::get_rs_pool() const {
 }
 
 uint32_t llama_memory_recurrent_context::get_n_snap() const {
+    if (mem->rs_replay > 0) {
+        return 2; // [TAG_RS_REPLAY] slot 0 the live row, slot 1 the kept state
+    }
     if (mem->rs_pool == 0 || mem->n_rs_seq == 0) {
         return mem->n_rs_seq + 1;
     }

@@ -85,6 +85,23 @@ public:
     std::vector<uint32_t> rs_snapbase; // per seq, rows from the pool's start
     std::vector<uint8_t>  rs_lock;     // per seq: a prompt job holds its rows (tu_capture), no re-packing past it
 
+    // [TAG_RS_REPLAY] LLAMA_RS_REPLAY=1 (or =N tokens, at least n_rs_seq + 1): no per-token rollback snapshots. Every write of a
+    // sequence keeps the state min(ubatch, N) tokens back in its one pool row (size + seq, slot 1 of the write) and the GDN inputs
+    // of its last N tokens in the rings (x_l: the pre-conv projections, g_l / b_l: the gate and beta), and a rollback of idx tokens
+    // replays the first min(ubatch, N) - idx of them from the kept state into the live row (llama_context::rs_replay, run before
+    // the sequence's next graph) instead of reading a snapshot. One scratch row after the pool rows holds a checkpoint's view
+    uint32_t rs_replay      = 0;  // tokens kept (0: off)
+    uint32_t rs_scratch_row = 0;
+    std::vector<int32_t> rs_view_row; // per seq: the row a checkpoint view reads instead of the live one (-1: none)
+    std::function<bool(llama_seq_id, uint32_t, uint32_t)> rs_replay_fn; // (seq, tokens to replay, dst row), set by the context
+    uint32_t rs_bak_row(llama_seq_id seq_id) const { return size + (uint32_t) seq_id; }
+    int32_t  seq_cell(llama_seq_id seq_id) const { return seq_id >= 0 && (uint32_t) seq_id < size ? cells[seq_id].tail : -1; }
+    // the pending rollback's replay: the tokens to replay (0: the kept state is the state), -1 when none is pending
+    int32_t  rs_replay_pending(llama_seq_id seq_id) const;
+    void     rs_replay_done(llama_seq_id seq_id);
+    bool     rs_copy_kept(llama_seq_id seq_id); // the kept state to the live row (the caller synchronized the device)
+    bool     rs_copy_row_to_live(llama_seq_id seq_id, uint32_t row_src);
+
     // every sequence's wanted depth at once (the plan: see set_rs_depths), or one sequence's; the depth granted is at most
     // n_rs_seq and what the pool's free rows hold, and a prompt job's sequence keeps its run until the job ends
     void     set_rs_depths(const std::vector<uint32_t> & want);
@@ -170,6 +187,10 @@ public:
     std::vector<ggml_tensor *> s_l;
     // a second conv history that must stay replicated across devices, so it cannot share the r row
     std::vector<ggml_tensor *> p_l;
+    // [TAG_RS_REPLAY] the input rings, F32 [C or H, rs_replay * n_seq_max] (null when off or not a recurrent layer)
+    std::vector<ggml_tensor *> x_l;
+    std::vector<ggml_tensor *> g_l;
+    std::vector<ggml_tensor *> b_l;
 
 private:
     //const llama_model & model;
@@ -234,6 +255,15 @@ public:
     ggml_tensor * get_s_l(int32_t il) const;
     ggml_tensor * get_p_l(int32_t il) const;
 
+    // [TAG_RS_REPLAY]
+    ggml_tensor * get_x_l(int32_t il) const;
+    ggml_tensor * get_g_l(int32_t il) const;
+    ggml_tensor * get_b_l(int32_t il) const;
+    uint32_t      get_rs_replay() const;
+    bool          is_replay() const { return replay; }
+    // a replay graph's context: one state written at head_row, read from src_row; no ubatch, apply() changes nothing
+    llama_memory_recurrent_context(llama_memory_recurrent * mem, uint32_t head_row, uint32_t src_row);
+
     int32_t s_copy(int i) const;
 
     // [TAG_RS_POOL] the rollback slots this ubatch's graph writes (1 + the smallest depth of its sequences; 1 + n_rs_seq in the
@@ -259,6 +289,8 @@ private:
         llama_seq_id         seq  = -1; // the job's sequence, whose pool rows stay locked until tu_release
         std::vector<int32_t> s_copy;
     } cap;
+
+    bool replay = false; // [TAG_RS_REPLAY]
 
     const llama_memory_status status;
 

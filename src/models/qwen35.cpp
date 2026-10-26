@@ -242,6 +242,12 @@ llama_model_qwen35::graph::graph(const llama_model & model, const llm_graph_para
     ggml_tensor * cur;
     ggml_tensor * inpL;
 
+    // [TAG_RS_REPLAY] a rollback's replay: the recurrent layers only, from the sequence's ring into its live row
+    if (params.gtype == LLM_GRAPH_TYPE_RS_REPLAY) {
+        build_rs_replay();
+        return;
+    }
+
     // a prompt job's group runs layers [il0, il1): the first starts from the token embeddings, a later one from the saved
     // residual; a group before the last ends by writing the residual there, the last builds the outputs. No input is created that
     // the group's layers do not read (every group holds both layer types, llama_model_qwen35::layer_group_period)
@@ -388,6 +394,13 @@ bool llama_model_qwen35::graph::tbo_applies() const {
         const char * e = getenv("LLAMA_TP_TBO_MIN");
         return e ? (int64_t) atoll(e) : (int64_t) 256;
     }();
+    static const bool replay_on = [] {
+        const char * e = getenv("LLAMA_RS_REPLAY");
+        return e != nullptr && atoi(e) != 0;
+    }();
+    if (replay_on) {
+        return false; // [TAG_RS_REPLAY] the halves' GDN inputs are not kept in the rings
+    }
     if (!on || model.split_mode() != LLAMA_SPLIT_MODE_TENSOR || n_tokens < std::max<int64_t>(n_min, 128)) {
         return false;
     }
@@ -755,6 +768,93 @@ void llama_model_qwen35::graph::build_layer_attn_halves(
         out[h] = cur;
         ggml_build_forward_expand(gf, cur);
     }
+}
+
+// [TAG_RS_REPLAY]
+void llama_model_qwen35::graph::build_rs_replay() {
+    GGML_ASSERT(ubatch.n_seqs == 1 && ubatch.n_seq_tokens == ubatch.n_tokens && ubatch.n_tokens >= 1);
+    auto * inp = build_rs_inp();
+    GGML_ASSERT(inp->replay_graph && inp->rs_replay > 0);
+    const llama_seq_id seq = ubatch.seq_id[0][0];
+    for (int il = 0; il < n_layer; ++il) {
+        if (hparams.is_recr(il)) {
+            build_layer_rs_replay(inp, seq, (int64_t) ubatch.n_seq_tokens, il);
+        }
+    }
+}
+
+// the GDN layer from its ring inputs: the conv and the delta rule as build_layer_attn_linear runs them, the state written to
+// the context's head row (the live row, or a checkpoint's scratch row), nothing else
+void llama_model_qwen35::graph::build_layer_rs_replay(llm_graph_input_rs * inp, llama_seq_id seq, int64_t k, int il) {
+    const auto * mctx_cur = inp->mctx;
+    const auto & layer_w  = model.layers[il];
+
+    const int64_t d_inner      = hparams.ssm_d_inner;
+    const int64_t n_seqs       = 1;
+    const int64_t head_k_dim   = hparams.ssm_d_state;
+    const int64_t num_k_heads  = hparams.ssm_n_group;
+    const int64_t num_v_heads  = hparams.ssm_dt_rank;
+    const int64_t head_v_dim   = d_inner / num_v_heads;
+    const int64_t n_seq_tokens = k;
+    const uint32_t M = inp->rs_replay;
+    GGML_ASSERT(M > 0 && k >= 1 && (uint32_t) k <= M);
+
+    ggml_tensor * x_all = mctx_cur->get_x_l(il);
+    ggml_tensor * g_all = mctx_cur->get_g_l(il);
+    ggml_tensor * b_all = mctx_cur->get_b_l(il);
+    GGML_ASSERT(x_all != nullptr && g_all != nullptr && b_all != nullptr);
+    const size_t row0 = (size_t) seq * M;
+
+    ggml_tensor * qkv_mixed = ggml_view_3d(ctx0, x_all, x_all->ne[0], k, 1, x_all->nb[1], (size_t) k * x_all->nb[1], row0 * x_all->nb[1]);
+    ggml_tensor * gate      = ggml_view_4d(ctx0, g_all, 1, num_v_heads, k, 1, g_all->nb[0], g_all->nb[1], (size_t) k * g_all->nb[1], row0 * g_all->nb[1]);
+    ggml_tensor * beta      = ggml_view_4d(ctx0, b_all, 1, num_v_heads, k, 1, b_all->nb[0], b_all->nb[1], (size_t) k * b_all->nb[1], row0 * b_all->nb[1]);
+    cb(qkv_mixed, "rs_replay_qkv_mixed", il);
+
+    ggml_tensor * conv_states_all = mctx_cur->get_r_l(il);
+    ggml_tensor * ssm_states_all  = mctx_cur->get_s_l(il);
+
+    ggml_tensor * conv_kernel      = layer_w.ssm_conv1d;
+    const int64_t conv_kernel_size = conv_kernel->ne[0];
+    const int64_t conv_channels    = d_inner + 2 * hparams.ssm_n_group * hparams.ssm_d_state;
+
+    ggml_tensor * conv_input = build_conv_state(inp, conv_states_all, qkv_mixed, conv_kernel_size, conv_channels, il);
+
+    ggml_tensor * state = build_rs(inp, ssm_states_all, hparams.n_embd_s(), n_seqs);
+    state = ggml_reshape_4d(ctx0, state, head_v_dim, head_v_dim, num_v_heads, n_seqs);
+
+    ggml_tensor * conv_qkv_mix = ggml_silu(ctx0, ggml_ssm_conv(ctx0, conv_input, conv_kernel));
+
+    const int64_t qkv_dim = head_k_dim * num_k_heads * 2 + head_v_dim * num_v_heads;
+    const int64_t nb1_qkv = ggml_row_size(conv_qkv_mix->type, qkv_dim);
+
+    ggml_tensor * q_conv = ggml_view_4d(ctx0, conv_qkv_mix, head_k_dim, num_k_heads, n_seq_tokens, n_seqs,
+            ggml_row_size(conv_qkv_mix->type, head_k_dim), nb1_qkv, nb1_qkv * n_seq_tokens, 0);
+    ggml_tensor * k_conv = ggml_view_4d(ctx0, conv_qkv_mix, head_k_dim, num_k_heads, n_seq_tokens, n_seqs,
+            ggml_row_size(conv_qkv_mix->type, head_k_dim), nb1_qkv, nb1_qkv * n_seq_tokens,
+            head_k_dim * num_k_heads * ggml_element_size(conv_qkv_mix));
+    ggml_tensor * v_conv = ggml_view_4d(ctx0, conv_qkv_mix, head_v_dim, num_v_heads, n_seq_tokens, n_seqs,
+            ggml_row_size(conv_qkv_mix->type, head_v_dim), nb1_qkv, nb1_qkv * n_seq_tokens,
+            ggml_row_size(conv_qkv_mix->type, 2 * head_k_dim * num_k_heads));
+
+    const float eps_norm = hparams.f_norm_rms_eps;
+    q_conv = build_gdn_l2_norm(ctx0, q_conv, eps_norm);
+    k_conv = build_gdn_l2_norm(ctx0, k_conv, eps_norm);
+
+    if (num_k_heads != num_v_heads && (!cparams.fused_gdn_ar || !cparams.fused_gdn_ch)) {
+        GGML_ASSERT(num_v_heads % num_k_heads == 0);
+        q_conv = ggml_repeat_4d(ctx0, q_conv, head_k_dim, num_v_heads, n_seq_tokens, n_seqs);
+        k_conv = ggml_repeat_4d(ctx0, k_conv, head_k_dim, num_v_heads, n_seq_tokens, n_seqs);
+    }
+
+    // the fused op, as the forward's verify step ran it, its final state to the head row
+    auto attn_out = build_delta_net_fused(q_conv, k_conv, v_conv, gate, beta, state, il);
+    ggml_tensor * new_state = attn_out.second;
+    cb(new_state, "rs_replay_state", il);
+    const auto kv_head = mctx_cur->get_head();
+    ggml_build_forward_expand(gf,
+            ggml_cpy(ctx0, new_state,
+                ggml_view_2d(ctx0, ssm_states_all, hparams.n_embd_s(), n_seqs, ssm_states_all->nb[1],
+                    kv_head * hparams.n_embd_s() * ggml_element_size(ssm_states_all))));
 }
 
 ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear_half(
@@ -1136,6 +1236,11 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
 
     ggml_tensor * conv_states_all = mctx_cur->get_r_l(il);
     ggml_tensor * ssm_states_all  = mctx_cur->get_s_l(il);
+
+    // [TAG_RS_REPLAY] the last tokens' GDN inputs to the sequence's ring, for a rollback's replay
+    build_rs_ring_write(inp, mctx_cur->get_x_l(il), qkv_mixed, il);
+    build_rs_ring_write(inp, mctx_cur->get_g_l(il), ggml_reshape_3d(ctx0, gate, num_v_heads, n_seq_tokens, n_seqs), il);
+    build_rs_ring_write(inp, mctx_cur->get_b_l(il), ggml_reshape_3d(ctx0, beta, num_v_heads, n_seq_tokens, n_seqs), il);
 
     ggml_tensor * conv_kernel      = model.layers[il].ssm_conv1d;
     const int64_t conv_kernel_size = conv_kernel->ne[0];

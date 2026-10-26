@@ -421,6 +421,13 @@ llama_context::llama_context(
         };
 
         memory.reset(model.create_memory(params_mem, cparams));
+
+        // [TAG_RS_REPLAY] a checkpoint's view replays through the context
+        if (auto * h = dynamic_cast<llama_memory_hybrid *>(memory.get())) {
+            if (auto * r = h->get_mem_recr()) {
+                r->rs_replay_fn = [this](llama_seq_id s, uint32_t k, uint32_t row) { return rs_replay(s, k, row); };
+            }
+        }
     }
 
     // the saved residual of a prompt job's ubatch, mirrored on every card, only for a context that can run jobs
@@ -2274,6 +2281,9 @@ int llama_context::decode(const llama_batch & batch_inp) {
         kv_compact(batch_inp);
     }
 
+    // [TAG_RS_REPLAY]
+    rs_replay_pending(batch_inp);
+
     llama_memory_context_ptr mctx;
 
     while (true) {
@@ -2831,6 +2841,108 @@ uint32_t llama_context::kv_room(llama_seq_id seq_id) const {
 }
 
 // [TAG_KV_COMPACT] llama_kv_cache::seq_compact for a batch of one sequence in a unified cache
+// [TAG_RS_REPLAY]
+void llama_context::rs_replay_pending(const llama_batch & b) {
+    auto * h = dynamic_cast<llama_memory_hybrid *>(memory.get());
+    llama_memory_recurrent * recr = h ? h->get_mem_recr() : nullptr;
+    if (recr == nullptr || recr->rs_replay == 0 || b.n_tokens <= 0) {
+        return;
+    }
+    static const bool rlog = getenv("LLAMA_RS_POOL_LOG") != nullptr;
+    std::vector<llama_seq_id> seen;
+    for (int32_t i = 0; i < b.n_tokens; ++i) {
+        const int32_t n = b.n_seq_id ? b.n_seq_id[i] : 1;
+        for (int32_t j = 0; j < n; ++j) {
+            const llama_seq_id s = b.seq_id ? b.seq_id[i][j] : 0;
+            if (std::find(seen.begin(), seen.end(), s) != seen.end()) {
+                continue;
+            }
+            seen.push_back(s);
+            const int32_t k = recr->rs_replay_pending(s);
+            if (k < 0) {
+                continue;
+            }
+            const int64_t t0 = ggml_time_us();
+            bool ok;
+            if (k == 0) {
+                synchronize();
+                ok = recr->rs_copy_kept(s);
+            } else {
+                const int32_t cell = recr->seq_cell(s);
+                ok = cell >= 0 && rs_replay(s, (uint32_t) k, (uint32_t) cell);
+            }
+            if (!ok) {
+                GGML_ABORT("[TAG_RS_REPLAY] the replay of %d tokens for sequence %d failed", k, s);
+            }
+            recr->rs_replay_done(s);
+            const int64_t dt = ggml_time_us() - t0;
+            rs_replay_n  += 1;
+            rs_replay_us += dt;
+            if (rlog) {
+                LLAMA_LOG_WARN("rs replay: seq %d, %d tokens, %.2f ms (%lld replays, %.2f ms mean)\n", s, k, dt/1000.0,
+                        (long long) rs_replay_n, rs_replay_us/1000.0/std::max<int64_t>(1, rs_replay_n));
+            }
+        }
+    }
+}
+
+bool llama_context::rs_replay(llama_seq_id seq_id, uint32_t k, uint32_t dst_row) {
+    auto * h = dynamic_cast<llama_memory_hybrid *>(memory.get());
+    llama_memory_recurrent * recr = h ? h->get_mem_recr() : nullptr;
+    if (recr == nullptr || recr->rs_replay == 0 || k == 0 || k > recr->rs_replay || seq_id < 0 || seq_id >= LLAMA_MAX_SEQ) {
+        return false;
+    }
+    // the ubatch: k tokens of the sequence (their ids and positions are not read)
+    rs_ub_tok.assign(k, 0);
+    rs_ub_pos.assign(k, 0);
+    rs_ub_nseq.assign(k, 1);
+    rs_ub_seq = seq_id;
+    rs_ub_seqp.assign(k, &rs_ub_seq);
+    rs_ub_unq.assign(1, seq_id);
+    rs_ub_seqidx.assign(LLAMA_MAX_SEQ, -1);
+    rs_ub_seqidx[seq_id] = 0;
+    rs_ub_out.assign(k, 0);
+    llama_ubatch ub = {};
+    ub.b_equal_seqs = 1;
+    ub.n_tokens     = k;
+    ub.n_seq_tokens = k;
+    ub.n_seqs       = 1;
+    ub.n_seqs_unq   = 1;
+    ub.n_pos        = 1;
+    ub.token        = rs_ub_tok.data();
+    ub.embd         = nullptr;
+    ub.pos          = rs_ub_pos.data();
+    ub.n_seq_id     = rs_ub_nseq.data();
+    ub.seq_id       = rs_ub_seqp.data();
+    ub.seq_id_unq   = rs_ub_unq.data();
+    ub.seq_idx      = rs_ub_seqidx.data();
+    ub.output       = rs_ub_out.data();
+
+    llama_memory_recurrent_context rctx(recr, dst_row, recr->rs_bak_row(seq_id));
+
+    if (!sched_rs) {
+        const size_t max_nodes = this->graph_max_nodes(std::min(cparams.n_ctx, cparams.n_ubatch));
+        sched_rs.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, false, cparams.op_offload));
+        sched_own_events(sched_rs.get());
+        gf_res_rs.reset(new llm_graph_result(gf_res_reserve->get_max_nodes()));
+        LLAMA_LOG_INFO("%s: the replay scheduler (sched_rs) is created for the rollbacks' replays (LLAMA_RS_REPLAY)\n", __func__);
+    }
+    std::swap(sched, sched_rs);
+    std::swap(gf_res_prev_active, gf_res_rs_active);
+    gf_res_override = gf_res_rs.get();
+    const uint32_t n_outputs_save = n_outputs;
+    n_outputs = 0;
+
+    ggml_status st = GGML_STATUS_SUCCESS;
+    llm_graph_result * res = process_ubatch(ub, LLM_GRAPH_TYPE_RS_REPLAY, &rctx, st);
+
+    n_outputs = n_outputs_save;
+    gf_res_override = nullptr;
+    std::swap(gf_res_prev_active, gf_res_rs_active);
+    std::swap(sched, sched_rs);
+    return res != nullptr && st == GGML_STATUS_SUCCESS;
+}
+
 void llama_context::kv_compact(const llama_batch & b) {
     if (!cparams.kv_unified || b.n_tokens <= 0) {
         return;
@@ -3076,6 +3188,9 @@ int32_t llama_context::job_begin(const llama_batch & batch_inp) {
 
     // [TAG_KV_COMPACT]
     kv_compact(batch);
+
+    // [TAG_RS_REPLAY]
+    rs_replay_pending(batch);
 
     llama_memory_context_ptr mctx;
     bool did_optimize = false;
@@ -4108,6 +4223,9 @@ void llama_context::inj_arena_swap() {
 }
 
 llm_graph_result * llama_context::get_gf_res_prev() {
+    if (gf_res_override) {
+        return gf_res_override; // [TAG_RS_REPLAY] a replay graph's own result
+    }
     if (inj_arena) {
         if (!gf_res_inj) {
             gf_res_inj.reset(new llm_graph_result(gf_res_reserve->get_max_nodes()));

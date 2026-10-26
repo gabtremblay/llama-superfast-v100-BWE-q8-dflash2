@@ -476,7 +476,7 @@ ggml_tensor * llm_build_delta_net_base::build_conv_state(
 
     const size_t row_size  = ggml_row_size(conv_states_all->type, row_count);
 
-    if (cparams.n_rs_seq == 0) {
+    if (cparams.n_rs_seq == 0 || inp->replay_graph) {
         const int64_t s_idx  = conv_input->ne[0] - conv_states->ne[0];
         const int64_t s_slot = 0;
 
@@ -494,6 +494,20 @@ ggml_tensor * llm_build_delta_net_base::build_conv_state(
         cb(conv_state_update, "conv_state_update", il);
 
         ggml_build_forward_expand(gf, ggml_cpy(ctx0, conv_state_last, conv_state_update));
+    } else if (inp->rs_replay > 0) {
+        // [TAG_RS_REPLAY] slot 0 the conv state after the ubatch, slot 1 the one ring_m tokens back (the input state when the
+        // ubatch is not longer than the ring)
+        const int64_t len = conv_input->ne[0] - conv_states->ne[0];
+        for (int64_t slot = 0; slot < 2; ++slot) {
+            const int64_t s_idx = slot == 0 ? len : len - (int64_t) inp->ring_m;
+            GGML_ASSERT(s_idx >= 0);
+            ggml_tensor * conv_state_last =
+                ggml_view_3d(ctx0, conv_input,
+                        conv_kernel_size - 1, conv_channels, n_seqs,
+                        conv_input->nb[1], conv_input->nb[2],
+                        ggml_row_size(conv_input->type, s_idx));
+            build_rs_slot_write(inp, conv_states_all, row_count, n_seqs, slot, conv_state_last);
+        }
     } else {
         // [TAG_RECURRENT_ROLLBACK_SPLITS]
         // this logic assumes that the last (n_rs_seq + 1) tokens of a sequence in a batch are inside
@@ -516,6 +530,21 @@ ggml_tensor * llm_build_delta_net_base::build_conv_state(
     }
 
     return conv_input;
+}
+
+// [TAG_RS_REPLAY]
+void llm_build_delta_net_base::build_rs_ring_write(llm_graph_input_rs * inp, ggml_tensor * ring, ggml_tensor * src, int il) {
+    if (inp->rs_replay == 0 || inp->replay_graph || ring == nullptr || inp->ring_idx == nullptr) {
+        return;
+    }
+    const int64_t m = inp->ring_m;
+    const int64_t T = src->ne[1];
+    const int64_t B = src->ne[2];
+    GGML_ASSERT(src->ne[0] == ring->ne[0] && m >= 1 && m <= T && src->type == GGML_TYPE_F32);
+    ggml_tensor * tail = ggml_view_3d(ctx0, src, src->ne[0], m, B, src->nb[1], src->nb[2], (size_t) (T - m) * src->nb[1]);
+    ggml_tensor * w    = ggml_set_rows(ctx0, ring, tail, inp->ring_idx);
+    ggml_format_name(w, "rs_ring_write-%d", il);
+    ggml_build_forward_expand(gf, w);
 }
 
 int64_t llm_build_delta_net_base::rs_n_slots(const llm_graph_input_rs * inp) const {
@@ -563,7 +592,7 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
     const int64_t n_seqs       = s->ne[3];
     const int64_t n_seq_tokens = q->ne[2];
 
-    const bool keep = cparams.n_rs_seq > 0;
+    const bool keep = cparams.n_rs_seq > 0 && !inp->replay_graph; // [TAG_RS_REPLAY] a replay writes the live row only
 
     if (!keep) {
         auto attn_out = build_delta_net(q, k, v, g, b, s, il);
@@ -585,6 +614,11 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
 
     // state s is 4D [S_v, S_v, H_v, n_seqs]; K snapshot slots are written into the output.
     ggml_tensor * gdn_out = ggml_gated_delta_net(ctx0, q, k, v, g, b, s, K);
+    if (inp->rs_replay > 0) {
+        // [TAG_RS_REPLAY] slot 1 the state ring_m tokens back, to the sequence's kept row
+        GGML_ASSERT(K == 2);
+        ggml_gated_delta_net_set_snap_back(gdn_out, (int32_t) inp->rs_replay);
+    }
     if (n_seq_tokens > 1) {
         res->add_fused_node({LLM_FUSED_OP_GDN_CH, gdn_out, il});
     } else {
@@ -605,7 +639,7 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
     const size_t row_size = hparams.n_embd_s() * ggml_element_size(ssm_states_all);
 
     // op writes the last min(n_seq_tokens, K) snapshots; trailing slots are left unwritten
-    const int64_t n_written = std::min<int64_t>(n_seq_tokens, K);
+    const int64_t n_written = inp->rs_replay > 0 ? K : std::min<int64_t>(n_seq_tokens, K); // [TAG_RS_REPLAY] slot 1 whatever the length
 
     if (inp->rs_pool == 0) {
         // write the produced snapshots into the recurrent cache (snapshot slot i -> rollback group i)

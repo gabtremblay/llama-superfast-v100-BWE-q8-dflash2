@@ -3543,7 +3543,8 @@ static int ggml_cuda_try_gdn_cache_fusion(
     const int64_t       n_seqs    = src_v->ne[3];
     const int64_t       D         = S_v * S_v * H;
     const int64_t       K         = ggml_get_op_params_i32(gdn, 0); // snapshot slot count
-    const int64_t       n_written = std::min<int64_t>(n_tokens, K); // newest n_written slots are written
+    // [TAG_RS_REPLAY] with snap_back (op param 1) slot 1 is written whatever the ubatch's length
+    const int64_t       n_written = ggml_get_op_params_i32(gdn, 1) > 0 ? K : std::min<int64_t>(n_tokens, K); // newest n_written slots are written
 
     // snapshot tail starts right after the attention scores
     const size_t tail_off = ggml_row_size(GGML_TYPE_F32, S_v * H * n_tokens * n_seqs);

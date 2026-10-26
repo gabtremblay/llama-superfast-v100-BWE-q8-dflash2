@@ -502,6 +502,11 @@ private:
 
     bool tu_feat_any() const; // a layer input is enabled
     void kv_compact(const llama_batch & b); // [TAG_KV_COMPACT]
+
+    // [TAG_RS_REPLAY] the pending rollbacks of the batch's sequences, replayed before its graphs; rs_replay runs one replay
+    // graph (k tokens of seq_id's ring from its kept state into dst_row) on its own scheduler
+    void rs_replay_pending(const llama_batch & b);
+    bool rs_replay(llama_seq_id seq_id, uint32_t k, uint32_t dst_row);
     bool tu_feat_reserve();   // allocates tu_feat for the enabled layers, once
 
     // the layer range of the graph being built (graph_params)
@@ -658,6 +663,22 @@ private:
     // own (swapped in for the decode), so the injection graph and the draft pass graph stay allocated side by side and each is reused
     // round after round instead of both being rebuilt and re-allocated every round. LLAMA_DFLASH2_INJ_ARENA=0 turns it off
     ggml_backend_sched_ptr sched_inj;
+
+    // [TAG_RS_REPLAY] the replay graphs' scheduler and graph result, so the decode's graph stays allocated and reusable
+    ggml_backend_sched_ptr sched_rs;
+    llm_graph_result_ptr   gf_res_rs;
+    llm_graph_result *     gf_res_rs_active   = nullptr;
+    llm_graph_result *     gf_res_override    = nullptr;
+    int64_t                rs_replay_n        = 0;
+    int64_t                rs_replay_us       = 0;
+    std::vector<llama_token>    rs_ub_tok;
+    std::vector<llama_pos>      rs_ub_pos;
+    std::vector<int32_t>        rs_ub_nseq;
+    std::vector<llama_seq_id *> rs_ub_seqp;
+    std::vector<llama_seq_id>   rs_ub_unq;
+    std::vector<int32_t>        rs_ub_seqidx;
+    std::vector<int8_t>         rs_ub_out;
+    llama_seq_id                rs_ub_seq = 0;
     llm_graph_result_ptr   gf_res_inj;
     llm_graph_result *     gf_res_inj_active = nullptr;
     bool                   inj_arena = false; // the injection's scheduler and arena are swapped in

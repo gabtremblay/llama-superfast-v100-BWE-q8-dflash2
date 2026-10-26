@@ -6547,6 +6547,12 @@ struct ggml_tensor * ggml_solve_tri(
 
 // ggml_gated_delta_net
 
+void ggml_gated_delta_net_set_snap_back(struct ggml_tensor * a, int32_t n) {
+    GGML_ASSERT(a->op == GGML_OP_GATED_DELTA_NET);
+    GGML_ASSERT(n == 0 || ggml_get_op_params_i32(a, 0) == 2);
+    ggml_set_op_params_i32(a, 1, n);
+}
+
 struct ggml_tensor * ggml_gated_delta_net(
         struct ggml_context * ctx,
         struct ggml_tensor  * q,
@@ -6590,6 +6596,7 @@ struct ggml_tensor * ggml_gated_delta_net(
     struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
 
     ggml_set_op_params_i32(result, 0, (int32_t) K);
+    ggml_set_op_params_i32(result, 1, 0); // [TAG_RS_REPLAY] snap_back, ggml_gated_delta_net_set_snap_back
 
     result->op     = GGML_OP_GATED_DELTA_NET;
     result->src[0] = q;

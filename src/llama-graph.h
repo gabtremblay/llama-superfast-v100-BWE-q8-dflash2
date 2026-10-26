@@ -43,6 +43,7 @@ enum llm_graph_type {
     LLM_GRAPH_TYPE_ENCODER,
     LLM_GRAPH_TYPE_DECODER,
     LLM_GRAPH_TYPE_DECODER_MTP,
+    LLM_GRAPH_TYPE_RS_REPLAY, // [TAG_RS_REPLAY] a rollback's replay: the recurrent layers from a sequence's input ring
 };
 
 // a graph over layers [il_begin, il_end) of one ubatch, for a resumable prompt job
@@ -295,6 +296,14 @@ public:
     uint32_t              rs_pool = 0;
     uint32_t              n_snap  = 1;
     std::vector<uint32_t> snap_row1;
+
+    // [TAG_RS_REPLAY] rs_replay: the tokens of GDN inputs a sequence's ring keeps (0: off); ring_m the ubatch's tokens that go to
+    // it (min(n_seq_tokens, rs_replay)), ring_idx their rows (seq*rs_replay + j), I32 [ring_m, n_seqs]; replay_graph: this graph
+    // replays a ring into the live row (one state read from the kept row, no snapshots, no ring writes)
+    uint32_t      rs_replay    = 0;
+    uint32_t      ring_m       = 0;
+    bool          replay_graph = false;
+    ggml_tensor * ring_idx     = nullptr;
 
     const llama_memory_recurrent_context * mctx;
 
