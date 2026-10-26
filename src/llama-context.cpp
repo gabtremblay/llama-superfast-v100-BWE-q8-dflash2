@@ -3015,6 +3015,46 @@ void llama_context::rs_replay_pending(const llama_batch & b) {
     if (!pending.empty() && !rs_replay_batch(seqs, ks, dsts)) {
         GGML_ABORT("[TAG_RS_REPLAY] the replay of %zu sequences failed", pending.size());
     }
+    {
+        // LLAMA_RS_REPLAY_SELFTEST=2: a batched replay of several sequences against each one's own: replayed alone into the
+        // scratch row and compared with the live row the batch wrote (the pad tokens of the shorter ones must leave their
+        // states as they are)
+        static const int selftest_lvl = getenv("LLAMA_RS_REPLAY_SELFTEST") ? atoi(getenv("LLAMA_RS_REPLAY_SELFTEST")) : 0;
+        if (selftest_lvl >= 2 && pending.size() > 1) {
+            for (size_t i = 0; i < seqs.size(); ++i) {
+                synchronize();
+                if (!rs_replay(seqs[i], ks[i], recr->rs_scratch_row)) {
+                    LLAMA_LOG_WARN("rs replay selftest (batch of %zu): seq %d: the single replay failed\n", seqs.size(), seqs[i]);
+                    continue;
+                }
+                synchronize();
+                int n_bad = 0;
+                float max_diff = 0.0f;
+                for (size_t il = 0; il < recr->s_l.size(); ++il) {
+                    for (ggml_tensor * t : { recr->r_l[il], recr->s_l[il] }) {
+                        if (t == nullptr) {
+                            continue;
+                        }
+                        const size_t n = (size_t) t->ne[0];
+                        std::vector<float> a(n), b(n);
+                        ggml_backend_tensor_get(t, a.data(), (size_t) dsts[i] * t->nb[1], n*sizeof(float));
+                        ggml_backend_tensor_get(t, b.data(), (size_t) recr->rs_scratch_row * t->nb[1], n*sizeof(float));
+                        float d = 0.0f;
+                        for (size_t q = 0; q < n; ++q) {
+                            d = std::max(d, std::fabs(a[q] - b[q]));
+                            if (std::isnan(a[q]) || std::isnan(b[q])) { d = INFINITY; }
+                        }
+                        if (d > 0.0f) {
+                            n_bad++;
+                            max_diff = std::max(max_diff, d);
+                        }
+                    }
+                }
+                LLAMA_LOG_WARN("rs replay selftest (batch of %zu): seq %d, %u tokens: %s (%d tensors differ, max |diff| %g)\n",
+                        seqs.size(), seqs[i], ks[i], n_bad == 0 ? "IDENTICAL" : "DIFFERENT", n_bad, (double) max_diff);
+            }
+        }
+    }
     for (llama_seq_id s : copied) {
         recr->rs_replay_done(s);
     }
