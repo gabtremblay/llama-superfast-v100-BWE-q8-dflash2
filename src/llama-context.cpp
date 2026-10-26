@@ -3088,7 +3088,7 @@ bool llama_context::rs_replay_batch(const std::vector<llama_seq_id> & seqs, cons
                 bufs += format(" %s %.2f MiB", ggml_backend_buft_name(backend_buft[i]), sz/1024.0/1024.0);
             }
         }
-        LLAMA_LOG_INFO("%s: replay scheduler for %u tokens (LLAMA_RS_REPLAY): compute buffers%s\n", __func__, k, bufs.c_str());
+        LLAMA_LOG_WARN("%s: replay scheduler for %u (length x sequences key, LLAMA_RS_REPLAY): compute buffers%s\n", __func__, k, bufs.c_str());
     }
     std::swap(gf_res_prev_active, gf_res_rs_active_k[k]);
     std::swap(sched, sched_rs_k[k]);
