@@ -1592,24 +1592,44 @@ bool llama_kv_cache::seq_compact(llama_seq_id seq_id, uint32_t n_next, const std
 
     // no decode may be reading or writing the cache while its rows move
     sync();
+    auto move_rows = [&](ggml_tensor * t) {
+        for (size_t j = 0; j < idx.size(); ) {
+            size_t n = 1;
+            while (j + n < idx.size() && idx[j + n] == idx[j] + n) {
+                ++n;
+            }
+            ggml_tensor s = *t;
+            s.ne[1]    = (int64_t) n;
+            s.data     = (char *) t->data + (size_t) idx[j]*t->nb[1];
+            s.view_src = t->view_src ? t->view_src : t;
+            ggml_tensor d = s;
+            d.data     = (char *) t->data + (size_t) (best + j)*t->nb[1];
+            ggml_backend_tensor_copy(&s, &d);
+            j += n;
+        }
+    };
     for (auto & layer : layers) {
         for (ggml_tensor * t : { layer.k_stream[0], layer.v_stream[0] }) {
             if (t == nullptr) {
                 continue;
             }
-            for (size_t j = 0; j < idx.size(); ) {
-                size_t n = 1;
-                while (j + n < idx.size() && idx[j + n] == idx[j] + n) {
-                    ++n;
+            // [TAG_KV_TP] under --split-mode tensor the stream is a meta tensor: every device holds its heads of every cell,
+            // so a cell's row moves on each device's own tensor, where data and nb[1] are that device's. The stream is a view
+            // of the layer's tensor; with one stream (the only case here) it is the whole of it
+            const size_t n_dev = ggml_backend_meta_buffer_n_simple(t->buffer);
+            if (n_dev == 0) {
+                move_rows(t);
+                continue;
+            }
+            ggml_tensor * base = t->view_src ? t->view_src : t;
+            GGML_ASSERT(t->view_offs == 0 && base->ne[1] == t->ne[1]);
+            for (size_t dev = 0; dev < n_dev; ++dev) {
+                ggml_tensor * td = ggml_backend_meta_tensor_simple(t, dev);
+                if (td == nullptr) {
+                    td = ggml_backend_meta_tensor_simple(base, dev);
                 }
-                ggml_tensor s = *t;
-                s.ne[1]    = (int64_t) n;
-                s.data     = (char *) t->data + (size_t) idx[j]*t->nb[1];
-                s.view_src = t->view_src ? t->view_src : t;
-                ggml_tensor d = s;
-                d.data     = (char *) t->data + (size_t) (best + j)*t->nb[1];
-                ggml_backend_tensor_copy(&s, &d);
-                j += n;
+                GGML_ASSERT(td != nullptr && td->ne[1] == t->ne[1] && "a split stream's per-device rows");
+                move_rows(td);
             }
         }
     }

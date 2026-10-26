@@ -1,6 +1,37 @@
 #include "llama-memory-recurrent.h"
 
 #include "ggml-backend.h"
+
+// [TAG_RS_TP] under --split-mode tensor a cache tensor is a meta tensor: every device holds its heads of every row. A row
+// copy runs on each device's own tensor, where data and nb[1] are that device's, instead of the generic copy's round trip
+// through the host. One entry, the tensor itself, when it is not split
+static std::vector<ggml_tensor *> rs_dev_tensors(ggml_tensor * t) {
+    std::vector<ggml_tensor *> r;
+    const size_t n = ggml_backend_meta_buffer_n_simple(t->buffer);
+    if (n == 0) {
+        r.push_back(t);
+        return r;
+    }
+    for (size_t j = 0; j < n; ++j) {
+        ggml_tensor * tj = ggml_backend_meta_tensor_simple(t, j);
+        GGML_ASSERT(tj != nullptr && tj->ne[1] == t->ne[1] && "a split cache's per-device rows");
+        r.push_back(tj);
+    }
+    return r;
+}
+
+// the devices a row copy runs on (rs_dev_tensors), for the views it needs
+static size_t rs_n_dev(const std::vector<ggml_tensor *> & r_l, const std::vector<ggml_tensor *> & s_l) {
+    size_t n = 1;
+    for (const auto * v : { &r_l, &s_l }) {
+        for (ggml_tensor * t : *v) {
+            if (t != nullptr) {
+                n = std::max(n, std::max<size_t>(1, ggml_backend_meta_buffer_n_simple(t->buffer)));
+            }
+        }
+    }
+    return n;
+}
 #include "llama-impl.h"
 #include "llama-io.h"
 #include "llama-batch.h"
@@ -528,7 +559,7 @@ void llama_memory_recurrent::rs_apply_pending(llama_seq_id seq_id) {
     }
     const int32_t tail = (uint32_t) seq_id < size ? cells[seq_id].tail : -1;
     if (tail >= 0 && cells[tail].has_seq_id(seq_id)) {
-        const size_t n_views = 2*3*r_l.size();
+        const size_t n_views = 2*3*r_l.size()*rs_n_dev(r_l, s_l);
         if (!bak_view_ctx || ggml_get_mem_size(bak_view_ctx.get()) < n_views*ggml_tensor_overhead()) {
             ggml_init_params ip = { n_views*ggml_tensor_overhead(), nullptr, true };
             bak_view_ctx.reset(ggml_init(ip));
@@ -542,11 +573,13 @@ void llama_memory_recurrent::rs_apply_pending(llama_seq_id seq_id) {
             if (t == nullptr) {
                 return;
             }
-            ggml_tensor * vs = ggml_view_1d(vctx, t, t->ne[0], (size_t) row_src*t->nb[1]);
-            ggml_tensor * vd = ggml_view_1d(vctx, t, t->ne[0], (size_t) row_dst*t->nb[1]);
-            ggml_backend_view_init(vs);
-            ggml_backend_view_init(vd);
-            ggml_backend_tensor_copy(vs, vd);
+            for (ggml_tensor * td : rs_dev_tensors(t)) {
+                ggml_tensor * vs = ggml_view_1d(vctx, td, td->ne[0], (size_t) row_src*td->nb[1]);
+                ggml_tensor * vd = ggml_view_1d(vctx, td, td->ne[0], (size_t) row_dst*td->nb[1]);
+                ggml_backend_view_init(vs);
+                ggml_backend_view_init(vd);
+                ggml_backend_tensor_copy(vs, vd);
+            }
         };
         for (size_t il = 0; il < r_l.size(); ++il) {
             copy_row(r_l[il]);
@@ -1524,7 +1557,7 @@ void llama_memory_recurrent::rs_backup(llama_seq_id seq_id, const std::function<
         return;
     }
 
-    const size_t n_views = 2*3*(size_t) r_l.size()*(size == 1 ? 1 : n_valid);
+    const size_t n_views = 2*3*(size_t) r_l.size()*(size == 1 ? 1 : n_valid)*rs_n_dev(r_l, s_l);
     if (!bak_view_ctx || ggml_get_mem_size(bak_view_ctx.get()) < n_views*ggml_tensor_overhead()) {
         ggml_init_params ip = { n_views*ggml_tensor_overhead(), nullptr, true };
         bak_view_ctx.reset(ggml_init(ip));
@@ -1538,17 +1571,19 @@ void llama_memory_recurrent::rs_backup(llama_seq_id seq_id, const std::function<
         if (t == nullptr) {
             return;
         }
-        auto view = [&](int64_t n, size_t offs) {
-            ggml_tensor * v = ggml_view_1d(vctx, t, n, offs);
-            ggml_backend_view_init(v);
-            return v;
-        };
-        if (size == 1) {
-            copy(view(t->ne[0]*n_valid, 0), view(t->ne[0]*n_valid, (size_t) K*t->nb[1]));
-            return;
-        }
-        for (uint32_t j = 0; j < n_valid; ++j) {
-            copy(view(t->ne[0], ((size_t) j*size + c)*t->nb[1]), view(t->ne[0], ((size_t) (K + j)*size + c)*t->nb[1]));
+        for (ggml_tensor * td : rs_dev_tensors(t)) {
+            auto view = [&](int64_t n, size_t offs) {
+                ggml_tensor * v = ggml_view_1d(vctx, td, n, offs);
+                ggml_backend_view_init(v);
+                return v;
+            };
+            if (size == 1) {
+                copy(view(td->ne[0]*n_valid, 0), view(td->ne[0]*n_valid, (size_t) K*td->nb[1]));
+                continue;
+            }
+            for (uint32_t j = 0; j < n_valid; ++j) {
+                copy(view(td->ne[0], ((size_t) j*size + c)*td->nb[1]), view(td->ne[0], ((size_t) (K + j)*size + c)*td->nb[1]));
+            }
         }
     };
 

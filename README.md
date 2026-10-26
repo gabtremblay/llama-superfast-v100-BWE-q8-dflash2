@@ -167,6 +167,37 @@ Check the startup log for `two-user scheduling (LLAMA_TU): on`, the draft model 
 For MTP instead of DFlash2: `-md models/mtp-Qwen3.8-27B-Q4_0.gguf --spec-type draft-mtp`, without
 `LLAMA_DFLASH2_HEAD_FILE` or `--spec-draft-ubatch`. It decodes slower here.
 
+### Two or four cards (tensor parallel, untested)
+
+This fork was built and measured on one card. Upstream runs the 27B on two cards in tensor parallel (`--split-mode
+tensor`, the ggml meta backend, `GGML_CUDA_P2P=1`, `iommu=pt`; see its `README-27B.md`), and the fork's additions were
+adapted to that path, for any number of cards, so far only by reading the code: there is no multi-card machine here to
+run it on. What was done, and what to expect:
+
+- **The unified pool, cell placement, compaction, idle-slot eviction, the q8_0 cache and the per-batch window** work per
+  device: a split cache keeps every cell on every card (each holds its heads of it), so the cell bookkeeping is the same
+  and the row moves of a compaction run on each card's own slice. The device mask builder was already split-aware.
+- **DFlash2's device-fed features** (the draft reading the target's layer inputs on the GPU) copy card to card: with the
+  draft split like the target, each card feeds its own copy; with the draft pinned to one card (`--device-draft`), that
+  card's copy is read. A split target with a draft split differently refuses the device path and says so; set
+  `LLAMA_DFLASH2_FEAT_DEV=0` then.
+- **The two-user scheduler** runs its prompt jobs on the plain layer loop under the split (upstream's interleaved
+  two-half prefill is off while the draft reads layer inputs, as upstream decided), with MTP or DFlash2.
+- **The shared snapshot pool** restores and backs up its rows per card; the fused write is a per-card kernel already.
+- **Checkpoints** on a split cache go through upstream's path; the fork's staged copy (`LLAMA_CKPT_STAGE`) steps aside
+  for them.
+
+The line is upstream's two-card line with this fork's switches, for example on two cards:
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1 GGML_CUDA_P2P=1 LLAMA_RS_POOL=12 LLAMA_DFLASH2_HEAD_FILE=models/mtp-Qwen3.8-27B-Q4_0.gguf LLAMA_SPEC_DRAFT_VOCAB_FILE=models/draft-vocab-qwen3.8-27b.txt build/bin/llama-server -m models/Qwen3.8-27B-UD-Q4_K_XL.gguf -md models/Qwen3.8-27B-DFlash2-Q4_K_M.gguf --spec-type draft-dflash --spec-draft-n-max 7 --spec-draft-ubatch 512 -c 491520 --parallel 4 --kv-unified --split-mode tensor -fa on -ngl 99 -ctk q8_0 -ctv q8_0 -ctkd f16 -ctvd f16 -t 12 -b 2048 -ub 2048 --cache-ram 0 --jinja --metrics --temp 1.0 --top-p 0.95 --top-k 20 --host 127.0.0.1 --port 8080
+```
+
+Two 32 GB cards hold about twice the pool (the weights are split too), so `-c` can double; start lower and raise it
+while the server fits. Expect upstream's gains (1.35× decode, 1.7× prefill on two cards) on top of this fork's, not
+more: the draft's acceptance and the verify budget are the same. If something fails, the one-card line in `## Run`
+with `CUDA_VISIBLE_DEVICES=0` is the fallback, and a report with the server log is welcome.
+
 ## Vision
 
 The server takes images when Qwen3.8-27B's vision projector is loaded: `--mmproj models/mmproj-F16.gguf`
@@ -404,6 +435,8 @@ of section 11 skipped those prefixes (its 1,024-cell cap).
 - Four slots at 245,760 tokens use ~32.3 GB of the card's 32.5: no room for a fifth slot or a larger pool. The
   recurrent rows alone are 150 MiB each (section 13).
 - The first two prompts after a start pay ~0.4 s once each to allocate a device checkpoint copy.
+- Two or more cards (`--split-mode tensor`) are supported by code reading only (the section after `## Run`): nothing
+  here has run on more than one card.
 
 ## Credits and license
 

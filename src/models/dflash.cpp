@@ -17,7 +17,10 @@ public:
         GGML_ASSERT(feat->ne[1] == (int64_t) ubatch->n_tokens);
         ggml_backend_t be = ggml_backend_sched_get_tensor_backend(sched, feat);
         for (int64_t k = 0; k < feat->ne[2]; ++k) {
-            GGML_ASSERT(src->copy_layer_inp_dev((uint32_t) k, feat, (size_t) k * feat->nb[2], be));
+            if (!src->copy_layer_inp_dev((uint32_t) k, feat, (size_t) k * feat->nb[2], be)) {
+                GGML_ABORT("the target's device features could not be copied to the draft (slot %d): under --split-mode tensor pin "
+                           "the draft to one device (--device-draft) or set LLAMA_DFLASH2_FEAT_DEV=0", (int) k);
+            }
         }
     }
 

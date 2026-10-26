@@ -1383,24 +1383,72 @@ bool llama_context::copy_layer_inp_dev(uint32_t slot, const ggml_tensor * dst, s
             dst_offs + n_rows*src->nb[1] > ggml_nbytes(dst)) {
         return false;
     }
-    for (int64_t i = 0; i < n_rows; ) {
-        const int64_t r0 = layer_inp_dev_sel.empty() ? i : layer_inp_dev_sel[i];
-        int64_t n = 1;
-        while (i + n < n_rows && (layer_inp_dev_sel.empty() || layer_inp_dev_sel[i + n] == r0 + n)) {
-            ++n;
+
+    // [TAG_FEAT_DEV_TP] under --split-mode tensor the target's layer input is a meta tensor mirrored on every device, and so
+    // is the draft's feature tensor when the draft is split too: each device copies its own rows to its own copy, on its own
+    // stream. A draft pinned to one device (--device-draft) reads the copy on that device when the target has one, else the
+    // first device's. Rows a device holds only a slice of (not mirrored) are not handed out: the host path takes them
+    const size_t n_src = ggml_backend_meta_buffer_n_simple(src->buffer);
+    const size_t n_dst = ggml_backend_meta_buffer_n_simple(dst->buffer);
+    if ((n_src != 0 && !ggml_backend_is_meta(layer_inp_dev_backend)) || (n_dst != 0 && !ggml_backend_is_meta(backend_dst))) {
+        return false;
+    }
+    if (n_src != 0 && n_dst != 0 && n_src != n_dst) {
+        LLAMA_LOG_ERROR("%s: the target's layer inputs are split over %zu devices and the draft's features over %zu: pin the draft to one device (--device-draft)\n",
+                __func__, n_src, n_dst);
+        return false;
+    }
+    const size_t n_copies = std::max<size_t>(1, std::max(n_src, n_dst));
+    for (size_t c = 0; c < n_copies; ++c) {
+        const ggml_tensor * src_c = src;
+        const ggml_tensor * dst_c = dst;
+        ggml_backend_t be_src = layer_inp_dev_backend;
+        ggml_backend_t be_dst = backend_dst;
+        if (n_src != 0) {
+            size_t js = c;
+            if (n_dst == 0) {
+                js = 0;
+                for (size_t j = 0; j < n_src; ++j) {
+                    ggml_backend_t sb = ggml_backend_meta_simple_backend(layer_inp_dev_backend, j);
+                    if (sb != nullptr && ggml_backend_get_device(sb) == ggml_backend_get_device(backend_dst)) {
+                        js = j;
+                        break;
+                    }
+                }
+            }
+            src_c  = ggml_backend_meta_tensor_simple(src, js);
+            be_src = ggml_backend_meta_simple_backend(layer_inp_dev_backend, js);
+            if (src_c == nullptr || be_src == nullptr || src_c->ne[0] != src->ne[0] || src_c->ne[1] != src->ne[1] || src_c->nb[1] != src->nb[1]) {
+                return false;
+            }
         }
-        GGML_ASSERT(r0 >= 0 && r0 + n <= layer_inp_dev_n);
-        ggml_tensor s = *src;
-        ggml_tensor d = *src;
-        s.ne[1]    = n;
-        s.data     = (char *) src->data + r0*src->nb[1];
-        s.view_src = src->view_src ? src->view_src : src;
-        d.ne[1]    = n;
-        d.data     = (char *) dst->data + dst_offs + i*src->nb[1];
-        d.buffer   = dst->buffer;
-        d.view_src = dst->view_src ? dst->view_src : const_cast<ggml_tensor *>(dst);
-        ggml_backend_tensor_copy_async(layer_inp_dev_backend, backend_dst, &s, &d);
-        i += n;
+        if (n_dst != 0) {
+            dst_c  = ggml_backend_meta_tensor_simple(dst, c);
+            be_dst = ggml_backend_meta_simple_backend(backend_dst, c);
+            if (dst_c == nullptr || be_dst == nullptr || dst_c->ne[0] != dst->ne[0] || dst_c->ne[1] != dst->ne[1] ||
+                    dst_c->nb[1] != dst->nb[1] || dst_c->nb[2] != dst->nb[2]) {
+                return false;
+            }
+        }
+        for (int64_t i = 0; i < n_rows; ) {
+            const int64_t r0 = layer_inp_dev_sel.empty() ? i : layer_inp_dev_sel[i];
+            int64_t n = 1;
+            while (i + n < n_rows && (layer_inp_dev_sel.empty() || layer_inp_dev_sel[i + n] == r0 + n)) {
+                ++n;
+            }
+            GGML_ASSERT(r0 >= 0 && r0 + n <= layer_inp_dev_n);
+            ggml_tensor s = *src_c;
+            ggml_tensor d = *src_c;
+            s.ne[1]    = n;
+            s.data     = (char *) src_c->data + r0*src_c->nb[1];
+            s.view_src = src_c->view_src ? src_c->view_src : const_cast<ggml_tensor *>(src_c);
+            d.ne[1]    = n;
+            d.data     = (char *) dst_c->data + dst_offs + i*src_c->nb[1];
+            d.buffer   = dst_c->buffer;
+            d.view_src = dst_c->view_src ? dst_c->view_src : const_cast<ggml_tensor *>(dst_c);
+            ggml_backend_tensor_copy_async(be_src, be_dst, &s, &d);
+            i += n;
+        }
     }
     return true;
 }
@@ -3612,6 +3660,17 @@ void llama_context::pipe_rs_backup(const llama_batch & batch_inp) {
                 ggml_backend_tensor_copy_async(b.get(), b.get(), src, dst);
                 return;
             }
+            // [TAG_RS_TP] under --split-mode tensor the rows are per-device tensors of a split cache: that device's backend
+            // is one of the meta backend's
+            if (ggml_backend_is_meta(b.get())) {
+                for (size_t j = 0; j < ggml_backend_meta_n_backends(b.get()); ++j) {
+                    ggml_backend_t sb = ggml_backend_meta_simple_backend(b.get(), j);
+                    if (sb != nullptr && ggml_backend_get_device(sb) == dev) {
+                        ggml_backend_tensor_copy_async(sb, sb, src, dst);
+                        return;
+                    }
+                }
+            }
         }
         GGML_ABORT("no backend for a recurrent state buffer");
     };
@@ -4966,6 +5025,11 @@ bool llama_context::state_stage_writes(const std::vector<llama_state_write_info>
     for (const auto & w : writes) {
         ggml_backend_buffer_t buf = w.tensor->view_src ? w.tensor->view_src->buffer : w.tensor->buffer;
         if (ggml_backend_buffer_is_host(buf)) {
+            return false;
+        }
+        // [TAG_CKPT_STAGE] not for a split (meta) buffer: its bytes are slices on several devices, which the byte views below
+        // cannot address; the queued copies read the tensor through its buffer instead
+        if (ggml_backend_meta_buffer_n_simple(buf) != 0) {
             return false;
         }
         ggml_backend_t b = nullptr;
