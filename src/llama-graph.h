@@ -307,8 +307,9 @@ public:
     uint32_t      ring_m       = 0;
     bool          replay_graph = false;
     ggml_tensor * ring_idx     = nullptr;
-    ggml_tensor * replay_dst   = nullptr; // I32 [1]: the row a replay graph writes (an input, so the graph is reusable)
-    ggml_tensor * replay_rows  = nullptr; // I32 [k]: the ring rows a replay graph reads (seq*rs_replay + j)
+    ggml_tensor * replay_dst      = nullptr; // I32 [n_seqs]: the rows a replay graph writes (inputs, so the graph is reusable)
+    ggml_tensor * replay_rows     = nullptr; // I32 [k_max*n_seqs]: the ring rows it reads (seq*rs_replay + j; the zero row past a sequence's tokens)
+    ggml_tensor * replay_conv_rows = nullptr; // I32 [3*n_seqs]: the conv input columns (time rows of [C, (3+k_max)*n_seqs]) that end at each sequence's last token
 
     const llama_memory_recurrent_context * mctx;
 

@@ -349,17 +349,33 @@ void llm_graph_input_rs::set_input(const llama_ubatch * ubatch) {
 
     set_input_ring(ubatch);
     if (replay_dst) {
-        GGML_ASSERT(ggml_backend_buffer_is_host(replay_dst->buffer));
-        ((int32_t *) replay_dst->data)[0] = (int32_t) mctx->get_replay_dst();
-    }
-    if (replay_rows) {
-        GGML_ASSERT(ggml_backend_buffer_is_host(replay_rows->buffer) && replay_rows->ne[0] == (int64_t) ubatch->n_seq_tokens);
-        int32_t * data = (int32_t *) replay_rows->data;
-        const llama_seq_id seq = mctx->get_replay_seq(); // the ubatch names sequence 0 whichever one replays, for reuse
-        for (uint32_t j = 0; j < ubatch->n_seq_tokens; ++j) {
-            data[j] = (int32_t) (seq*rs_replay + j);
+        // a batched replay: sequence s replays ks[s] of the longest k_max tokens, its real tokens first, pad tokens (the zero
+        // ring row: no change to a state) after them; its conv state is the 3 input columns ending at its last real token
+        const auto & dsts = mctx->get_replay_dsts();
+        const auto & seqs = mctx->get_replay_seqs();
+        const auto & ks   = mctx->get_replay_ks();
+        const uint32_t N     = ubatch->n_seqs;
+        const uint32_t k_max = ubatch->n_seq_tokens;
+        GGML_ASSERT(dsts.size() == N && seqs.size() == N && ks.size() == N);
+        GGML_ASSERT(ggml_backend_buffer_is_host(replay_dst->buffer) && replay_dst->ne[0] == (int64_t) N);
+        GGML_ASSERT(ggml_backend_buffer_is_host(replay_rows->buffer) && replay_rows->ne[0] == (int64_t) k_max * N);
+        GGML_ASSERT(ggml_backend_buffer_is_host(replay_conv_rows->buffer) && replay_conv_rows->ne[0] == (int64_t) 3 * N);
+        int32_t * d_dst  = (int32_t *) replay_dst->data;
+        int32_t * d_rows = (int32_t *) replay_rows->data;
+        int32_t * d_conv = (int32_t *) replay_conv_rows->data;
+        const int32_t zero_row = (int32_t) mctx->get_rs_ring_zero_row();
+        for (uint32_t i = 0; i < N; ++i) {
+            GGML_ASSERT(ks[i] >= 1 && ks[i] <= k_max);
+            d_dst[i] = (int32_t) dsts[i];
+            for (uint32_t j = 0; j < k_max; ++j) {
+                d_rows[i*k_max + j] = j < ks[i] ? (int32_t) (seqs[i]*rs_replay + j) : zero_row;
+            }
+            for (uint32_t j = 0; j < 3; ++j) {
+                d_conv[i*3 + j] = (int32_t) (i*(3 + k_max) + ks[i] + j);
+            }
         }
     }
+}
 }
 
 
@@ -383,7 +399,9 @@ bool llm_graph_input_rs::can_reuse_ring(const llama_memory_recurrent_context * r
     res &= replay_graph == recr->is_replay();
     res &= (ring_idx != nullptr) == (recr->get_rs_replay() > 0 && !recr->is_replay());
     res &= (replay_dst != nullptr) == recr->is_replay();
-    res &= (replay_rows == nullptr) || replay_rows->ne[0] == (int64_t) ubatch.n_seq_tokens;
+    res &= (replay_dst == nullptr) || replay_dst->ne[0] == (int64_t) ubatch.n_seqs;
+    res &= (replay_rows == nullptr) || replay_rows->ne[0] == (int64_t) ubatch.n_seq_tokens * ubatch.n_seqs;
+    res &= (replay_conv_rows == nullptr) || replay_conv_rows->ne[0] == (int64_t) 3 * ubatch.n_seqs;
     if (ring_idx != nullptr) {
         res &= ring_idx->ne[0] == (int64_t) std::min<uint32_t>(ubatch.n_seq_tokens, rs_replay) * ubatch.n_seqs;
     }
@@ -4109,10 +4127,12 @@ static std::unique_ptr<llm_graph_input_rs> build_rs_inp_impl(
     inp->rs_replay    = mctx_cur->get_rs_replay();
     inp->replay_graph = mctx_cur->is_replay();
     if (inp->replay_graph) {
-        inp->replay_dst = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, 1);
+        inp->replay_dst = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_seqs);
         ggml_set_input(inp->replay_dst);
-        inp->replay_rows = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, ubatch.n_seq_tokens);
+        inp->replay_rows = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, (int64_t) ubatch.n_seq_tokens * n_seqs);
         ggml_set_input(inp->replay_rows);
+        inp->replay_conv_rows = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, 3 * n_seqs);
+        ggml_set_input(inp->replay_conv_rows);
     }
     if (inp->rs_replay > 0 && !inp->replay_graph) {
         inp->ring_m   = std::min<uint32_t>(ubatch.n_seq_tokens, inp->rs_replay);

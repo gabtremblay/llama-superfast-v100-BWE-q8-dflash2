@@ -95,6 +95,7 @@ public:
     std::vector<int32_t> rs_view_row; // per seq: the row a checkpoint view reads instead of the live one (-1: none)
     std::function<bool(llama_seq_id, uint32_t, uint32_t)> rs_replay_fn; // (seq, tokens to replay, dst row), set by the context
     uint32_t rs_bak_row(llama_seq_id seq_id) const { return size + (uint32_t) seq_id; }
+    uint32_t rs_ring_zero_row() const { return rs_replay * n_seq_max; } // the ring's last row, all zero: a pad token
     int32_t  seq_cell(llama_seq_id seq_id) const { return seq_id >= 0 && (uint32_t) seq_id < size ? cells[seq_id].tail : -1; }
     // the pending rollback's replay: the tokens to replay (0: the kept state is the state), -1 when none is pending
     int32_t  rs_replay_pending(llama_seq_id seq_id) const;
@@ -265,10 +266,14 @@ public:
     ggml_tensor * get_b_l(int32_t il) const;
     uint32_t      get_rs_replay() const;
     bool          is_replay() const { return replay; }
-    uint32_t      get_replay_dst() const { return replay_dst; }
-    llama_seq_id  get_replay_seq() const { return replay_seq; }
-    // a replay graph's context: one state written at head_row, read from src_row; no ubatch, apply() changes nothing
-    llama_memory_recurrent_context(llama_memory_recurrent * mem, uint32_t head_row, uint32_t src_row, llama_seq_id seq);
+    const std::vector<uint32_t>     & get_replay_dsts() const { return replay_dsts; }
+    const std::vector<llama_seq_id> & get_replay_seqs() const { return replay_seqs; }
+    const std::vector<uint32_t>     & get_replay_ks()   const { return replay_ks; }
+    uint32_t                          get_rs_ring_zero_row() const;
+    // a replay graph's context: the sequences seqs replay ks tokens each, their states read from src_rows and written to
+    // dst_rows; no ubatch, apply() changes nothing
+    llama_memory_recurrent_context(llama_memory_recurrent * mem, const std::vector<uint32_t> & dst_rows, const std::vector<uint32_t> & src_rows,
+            const std::vector<llama_seq_id> & seqs, const std::vector<uint32_t> & ks);
 
     int32_t s_copy(int i) const;
 
@@ -297,8 +302,9 @@ private:
     } cap;
 
     bool     replay     = false; // [TAG_RS_REPLAY]
-    uint32_t replay_dst = 0;     // the row a replay graph writes (its head stays 0: the row is an input)
-    llama_seq_id replay_seq = 0; // the sequence whose ring a replay graph reads (an input too)
+    std::vector<uint32_t>     replay_dsts; // the rows a replay graph writes (its head stays 0: the rows are inputs)
+    std::vector<llama_seq_id> replay_seqs; // the sequences whose rings it reads, and how many tokens each
+    std::vector<uint32_t>     replay_ks;
 
     const llama_memory_status status;
 

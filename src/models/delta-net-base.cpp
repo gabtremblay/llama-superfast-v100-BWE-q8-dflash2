@@ -488,9 +488,18 @@ ggml_tensor * llm_build_delta_net_base::build_conv_state(
         cb(conv_state_last, "conv_state_last", il);
 
         if (inp->replay_graph) {
-            // [TAG_RS_REPLAY] to the row the input names, so the graph is the same whichever sequence replays
-            ggml_tensor * last = ggml_reshape_2d(ctx0, ggml_cont(ctx0, conv_state_last), row_count, n_seqs);
-            ggml_build_forward_expand(gf, ggml_set_rows(ctx0, conv_states_all, last, inp->replay_dst));
+            // [TAG_RS_REPLAY] each sequence's conv state is the 3 input columns ending at its last real token (its pad tokens
+            // come after), gathered through the input table and written to the rows the input names: the graph holds
+            // nothing of the sequences and is reused. conv_input is [3 + k_max, C, n_seqs], time first
+            const int64_t n_cols = conv_input->ne[0];
+            ggml_tensor * t = ggml_cont(ctx0, ggml_transpose(ctx0, conv_input));                            // [C, 3 + k_max, n_seqs]
+            t = ggml_reshape_2d(ctx0, t, conv_channels, n_cols * n_seqs);                                     // rows of time
+            t = ggml_get_rows(ctx0, t, inp->replay_conv_rows);                                               // [C, 3*n_seqs]
+            t = ggml_reshape_3d(ctx0, t, conv_channels, conv_kernel_size - 1, n_seqs);                        // [C, 3, n_seqs]
+            t = ggml_cont(ctx0, ggml_transpose(ctx0, t));                                                    // [3, C, n_seqs]
+            t = ggml_reshape_2d(ctx0, t, row_count, n_seqs);
+            ggml_build_forward_expand(gf, ggml_set_rows(ctx0, conv_states_all, t, inp->replay_dst));
+            GGML_UNUSED(conv_state_last);
             return conv_input;
         }
 

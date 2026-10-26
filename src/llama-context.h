@@ -507,6 +507,8 @@ private:
     // graph (k tokens of seq_id's ring from its kept state into dst_row) on its own scheduler
     void rs_replay_pending(const llama_batch & b);
     bool rs_replay(llama_seq_id seq_id, uint32_t k, uint32_t dst_row);
+    // the batched form: sequence seqs[i] replays ks[i] tokens into dst_rows[i], all in one graph (the shorter ones padded)
+    bool rs_replay_batch(const std::vector<llama_seq_id> & seqs, const std::vector<uint32_t> & ks, const std::vector<uint32_t> & dst_rows);
     bool tu_feat_reserve();   // allocates tu_feat for the enabled layers, once
 
     // the layer range of the graph being built (graph_params)

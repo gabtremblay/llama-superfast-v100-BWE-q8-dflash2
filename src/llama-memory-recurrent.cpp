@@ -189,9 +189,10 @@ llama_memory_recurrent::llama_memory_recurrent(
         if (rs_replay > 0) {
             const int64_t C  = hparams.ssm_d_inner + 2*hparams.ssm_n_group*hparams.ssm_d_state;
             const int64_t Hv = hparams.ssm_dt_rank;
-            x_l[i] = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, C,  (int64_t) rs_replay*n_seq_max);
-            g_l[i] = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, Hv, (int64_t) rs_replay*n_seq_max);
-            b_l[i] = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, Hv, (int64_t) rs_replay*n_seq_max);
+            // one row more, all zero (the buffer is cleared): the pad token of a batched replay
+            x_l[i] = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, C,  (int64_t) rs_replay*n_seq_max + 1);
+            g_l[i] = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, Hv, (int64_t) rs_replay*n_seq_max + 1);
+            b_l[i] = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, Hv, (int64_t) rs_replay*n_seq_max + 1);
             ggml_format_name(x_l[i], "rs_ring_x_l%d", i);
             ggml_format_name(g_l[i], "rs_ring_g_l%d", i);
             ggml_format_name(b_l[i], "rs_ring_b_l%d", i);
@@ -1850,17 +1851,27 @@ uint32_t llama_memory_recurrent_context::get_rs_replay() const {
     return mem->rs_replay;
 }
 
-llama_memory_recurrent_context::llama_memory_recurrent_context(llama_memory_recurrent * mem, uint32_t head_row, uint32_t src_row, llama_seq_id seq) :
+uint32_t llama_memory_recurrent_context::get_rs_ring_zero_row() const {
+    return mem->rs_ring_zero_row();
+}
+
+llama_memory_recurrent_context::llama_memory_recurrent_context(llama_memory_recurrent * mem, const std::vector<uint32_t> & dst_rows,
+        const std::vector<uint32_t> & src_rows, const std::vector<llama_seq_id> & seqs, const std::vector<uint32_t> & ks) :
         status(LLAMA_MEMORY_STATUS_NO_UPDATE), mem(mem) {
-    replay     = true;
-    replay_dst = head_row;
-    replay_seq = seq;
-    cap.on     = true;
-    cap.head   = 0;
-    cap.n      = 1;
-    cap.rs_z   = -1;
-    cap.seq    = -1;
-    cap.s_copy = { (int32_t) src_row };
+    GGML_ASSERT(!dst_rows.empty() && dst_rows.size() == src_rows.size() && seqs.size() == dst_rows.size() && ks.size() == dst_rows.size());
+    replay      = true;
+    replay_dsts = dst_rows;
+    replay_seqs = seqs;
+    replay_ks   = ks;
+    cap.on      = true;
+    cap.head    = 0;
+    cap.n       = (uint32_t) dst_rows.size();
+    cap.rs_z    = -1;
+    cap.seq     = -1;
+    cap.s_copy.clear();
+    for (uint32_t r : src_rows) {
+        cap.s_copy.push_back((int32_t) r);
+    }
 }
 
 ggml_tensor * llama_memory_recurrent_context::get_p_l(int32_t il) const {

@@ -772,25 +772,26 @@ void llama_model_qwen35::graph::build_layer_attn_halves(
 
 // [TAG_RS_REPLAY]
 void llama_model_qwen35::graph::build_rs_replay() {
-    GGML_ASSERT(ubatch.n_seqs == 1 && ubatch.n_seq_tokens == ubatch.n_tokens && ubatch.n_tokens >= 1);
+    GGML_ASSERT(ubatch.n_seqs >= 1 && ubatch.n_seq_tokens >= 1 && ubatch.n_tokens == ubatch.n_seq_tokens * ubatch.n_seqs);
     auto * inp = build_rs_inp();
     GGML_ASSERT(inp->replay_graph && inp->rs_replay > 0);
-    const llama_seq_id seq = ubatch.seq_id[0][0];
     for (int il = 0; il < n_layer; ++il) {
         if (hparams.is_recr(il)) {
-            build_layer_rs_replay(inp, seq, (int64_t) ubatch.n_seq_tokens, il);
+            build_layer_rs_replay(inp, 0, (int64_t) ubatch.n_seq_tokens, il);
         }
     }
 }
 
-// the GDN layer from its ring inputs: the conv and the delta rule as build_layer_attn_linear runs them, the state written to
-// the context's head row (the live row, or a checkpoint's scratch row), nothing else
+// the GDN layer from the sequences' ring inputs (k tokens each, the shorter ones padded with the zero row, a no-op for the
+// state): the conv and the delta rule as build_layer_attn_linear runs them, each sequence's state written to the row the
+// input names (its live row, or a checkpoint's scratch row), nothing else
 void llama_model_qwen35::graph::build_layer_rs_replay(llm_graph_input_rs * inp, llama_seq_id seq, int64_t k, int il) {
+    GGML_UNUSED(seq);
     const auto * mctx_cur = inp->mctx;
     const auto & layer_w  = model.layers[il];
 
     const int64_t d_inner      = hparams.ssm_d_inner;
-    const int64_t n_seqs       = 1;
+    const int64_t n_seqs       = ubatch.n_seqs;
     const int64_t head_k_dim   = hparams.ssm_d_state;
     const int64_t num_k_heads  = hparams.ssm_n_group;
     const int64_t num_v_heads  = hparams.ssm_dt_rank;
@@ -803,12 +804,10 @@ void llama_model_qwen35::graph::build_layer_rs_replay(llm_graph_input_rs * inp, 
     ggml_tensor * g_all = mctx_cur->get_g_l(il);
     ggml_tensor * b_all = mctx_cur->get_b_l(il);
     GGML_ASSERT(x_all != nullptr && g_all != nullptr && b_all != nullptr);
-    GGML_UNUSED(seq);
-    // the rows through the input table, so the graph holds nothing of the sequence and is reused for every one
-    GGML_ASSERT(inp->replay_rows != nullptr && inp->replay_rows->ne[0] == k);
-    ggml_tensor * qkv_mixed = ggml_reshape_3d(ctx0, ggml_get_rows(ctx0, x_all, inp->replay_rows), x_all->ne[0], k, 1);
-    ggml_tensor * gate      = ggml_reshape_4d(ctx0, ggml_get_rows(ctx0, g_all, inp->replay_rows), 1, num_v_heads, k, 1);
-    ggml_tensor * beta      = ggml_reshape_4d(ctx0, ggml_get_rows(ctx0, b_all, inp->replay_rows), 1, num_v_heads, k, 1);
+    GGML_ASSERT(inp->replay_rows != nullptr && inp->replay_rows->ne[0] == k * n_seqs);
+    ggml_tensor * qkv_mixed = ggml_reshape_3d(ctx0, ggml_get_rows(ctx0, x_all, inp->replay_rows), x_all->ne[0], k, n_seqs);
+    ggml_tensor * gate      = ggml_reshape_4d(ctx0, ggml_get_rows(ctx0, g_all, inp->replay_rows), 1, num_v_heads, k, n_seqs);
+    ggml_tensor * beta      = ggml_reshape_4d(ctx0, ggml_get_rows(ctx0, b_all, inp->replay_rows), 1, num_v_heads, k, n_seqs);
     cb(qkv_mixed, "rs_replay_qkv_mixed", il);
 
     ggml_tensor * conv_states_all = mctx_cur->get_r_l(il);
@@ -847,14 +846,13 @@ void llama_model_qwen35::graph::build_layer_rs_replay(llm_graph_input_rs * inp, 
         k_conv = ggml_repeat_4d(ctx0, k_conv, head_k_dim, num_v_heads, n_seq_tokens, n_seqs);
     }
 
-    // the fused op, as the forward's verify step ran it, its final state to the head row
+    // the fused op, as the forward's verify step ran it; the pad tokens leave a state as it is (gate 0, beta 0)
     auto attn_out = build_delta_net_fused(q_conv, k_conv, v_conv, gate, beta, state, il);
     ggml_tensor * new_state = attn_out.second;
     cb(new_state, "rs_replay_state", il);
     ggml_tensor * ns = ggml_reshape_2d(ctx0, ggml_cont(ctx0, new_state), hparams.n_embd_s(), n_seqs);
     ggml_build_forward_expand(gf, ggml_set_rows(ctx0, ssm_states_all, ns, inp->replay_dst));
 }
-
 ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear_half(
         llm_graph_input_rs * inp,
         ggml_tensor *        cur,
