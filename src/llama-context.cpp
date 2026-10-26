@@ -2964,7 +2964,7 @@ void llama_context::rs_replay_pending(const llama_batch & b) {
             rs_replay_n  += 1;
             rs_replay_us += dt;
             if (rlog) {
-                LLAMA_LOG_WARN("rs replay: seq %d, %d tokens, %.2f ms %s (%lld replays, %.2f ms mean)\n", s, k, dt/1000.0, k == 0 ? "copy" : rs_replay_last_reused ? "reused" : "REBUILT",
+                LLAMA_LOG_WARN("rs replay: seq %d, %d tokens, %.2f ms (prep %.2f, graph %.2f, post %.2f) %s (%lld replays, %.2f ms mean)\n", s, k, dt/1000.0, rs_replay_t_prep/1000.0, rs_replay_t_pu/1000.0, rs_replay_t_post/1000.0, k == 0 ? "copy" : rs_replay_last_reused ? "reused" : "REBUILT",
                         (long long) rs_replay_n, rs_replay_us/1000.0/std::max<int64_t>(1, rs_replay_n));
             }
         }
@@ -2977,6 +2977,7 @@ bool llama_context::rs_replay(llama_seq_id seq_id, uint32_t k, uint32_t dst_row)
     if (recr == nullptr || recr->rs_replay == 0 || k == 0 || k > recr->rs_replay || seq_id < 0 || seq_id >= LLAMA_MAX_SEQ) {
         return false;
     }
+    const int64_t t_a = ggml_time_us();
     // the ubatch: k tokens, owning its data (the graph reuse check wants that) and naming sequence 0 whichever sequence
     // replays: the sequence reaches the graph through the context's inputs (the ring rows, the kept row, the written row),
     // so one graph a length serves every sequence
@@ -3036,10 +3037,12 @@ bool llama_context::rs_replay(llama_seq_id seq_id, uint32_t k, uint32_t dst_row)
     ggml_status st = GGML_STATUS_SUCCESS;
     rs_replay_active = true;
     const int32_t n_reused0 = n_reused;
+    const int64_t t_b = ggml_time_us();
     ggml_rt_label(this, 100 + (int) k); // the round timers: replay graphs apart from the decode's (c0/10k)
     llm_graph_result * res = process_ubatch(ub, LLM_GRAPH_TYPE_RS_REPLAY, &rctx, st);
     rs_replay_active = false;
     rs_replay_last_reused = n_reused > n_reused0;
+    const int64_t t_c = ggml_time_us();
 
     n_outputs = n_outputs_save;
     gf_res_override = nullptr;
@@ -3055,6 +3058,12 @@ bool llama_context::rs_replay(llama_seq_id seq_id, uint32_t k, uint32_t dst_row)
     }
     std::swap(gf_res_prev_active, gf_res_rs_active_k[k]);
     std::swap(sched, sched_rs_k[k]);
+    rs_replay_t_prep = t_b - t_a;
+    rs_replay_t_pu   = t_c - t_b;
+    rs_replay_t_post = ggml_time_us() - t_c;
+    if (first) {
+        LLAMA_LOG_WARN("rs replay: scheduler for %u tokens: %d splits, %d copies\n", k, ggml_backend_sched_get_n_splits(sched_rs_k[k].get()), ggml_backend_sched_get_n_copies(sched_rs_k[k].get()));
+    }
     return res != nullptr && st == GGML_STATUS_SUCCESS;
 }
 
