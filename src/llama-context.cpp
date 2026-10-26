@@ -3077,6 +3077,21 @@ int32_t llama_context::job_begin(const llama_batch & batch_inp) {
     // [TAG_KV_COMPACT]
     kv_compact(batch);
 
+    // [TAG_RS_JOB_TOP] with a spare cell, the job's sequence takes the top cell before the job locks its rows: the other
+    // sequences then gather into runs below it, and never swap it (the runs of three sequences among four cells had to)
+    if (batch.n_tokens > 0) {
+        if (auto * h = dynamic_cast<llama_memory_hybrid *>(memory.get())) {
+            llama_memory_recurrent * r = h->get_mem_recr();
+            if (r != nullptr && r->size > cparams.n_seq_max) {
+                const llama_seq_id s = batch.seq_id ? batch.seq_id[0][0] : 0;
+                synchronize();
+                if (!r->rs_move_seq(s, r->size - 1)) {
+                    LLAMA_LOG_WARN("%s: the job's sequence %d could not take the top cell\n", __func__, s);
+                }
+            }
+        }
+    }
+
     llama_memory_context_ptr mctx;
     bool did_optimize = false;
     while (true) {

@@ -91,6 +91,10 @@ public:
     uint32_t set_rs_depth(llama_seq_id seq_id, uint32_t depth);
     // a rollback snapshot still to be read goes to the live row now (the caller synchronized the device)
     void     rs_apply_pending(llama_seq_id seq_id);
+    // [TAG_RS_JOB_TOP] a prompt job's sequence moves to the top cell before its groups lock it, so the other sequences'
+    // contiguous runs never straddle it (the caller synchronized the device)
+    bool     rs_copy_rows(uint32_t row_src, uint32_t row_dst);
+    bool     rs_move_seq(llama_seq_id seq_id, uint32_t dst);
     // the rollback depth of a sequence (n_rs_seq in the uniform layout)
     uint32_t get_rs_depth(llama_seq_id seq_id) const;
     // the row of snapshot idx of sequence seq whose live state is in cell (idx 0: that live row)
