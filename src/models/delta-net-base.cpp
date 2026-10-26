@@ -468,6 +468,11 @@ ggml_tensor * llm_build_delta_net_base::build_conv_state(
 
     qkv_mixed = ggml_transpose(ctx0, qkv_mixed);
     cb(qkv_mixed, "qkv_mixed_transposed", il);
+    if (inp->replay_graph) {
+        // [TAG_RS_REPLAY] contiguous first: the concat of a transposed view runs the generic kernel (19 us a layer
+        // against a 4 us transpose copy and the fast concat); the forward's concat is folded by the CUDA planner
+        qkv_mixed = ggml_cont(ctx0, qkv_mixed);
+    }
 
     ggml_tensor * conv_input = ggml_concat(ctx0, conv_states, qkv_mixed, 0);
     cb(conv_input, "conv_input", il);

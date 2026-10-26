@@ -365,7 +365,7 @@ void llm_graph_input_rs::set_input(const llama_ubatch * ubatch) {
         int32_t * d_conv = (int32_t *) replay_conv_rows->data;
         const int32_t zero_row = (int32_t) mctx->get_rs_ring_zero_row();
         for (uint32_t i = 0; i < N; ++i) {
-            GGML_ASSERT(ks[i] >= 1 && ks[i] <= k_max);
+            GGML_ASSERT(ks[i] <= k_max); // 0: a no-op slot (pad tokens only; its conv state is its kept one)
             d_dst[i] = (int32_t) dsts[i];
             for (uint32_t j = 0; j < k_max; ++j) {
                 d_rows[i*k_max + j] = j < ks[i] ? (int32_t) (seqs[i]*rs_replay + j) : zero_row;

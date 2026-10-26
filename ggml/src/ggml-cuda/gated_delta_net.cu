@@ -73,7 +73,8 @@ gated_delta_net_cuda(const float * q,
     // input state holds s0 only: [S_v, S_v, H, n_seqs] — seq stride is D = H * S_v * S_v.
     // output state layout (per-slot D * n_seqs) — same per-(seq,head) offset as before.
     const int64_t state_in_offset      = sequence * H * S_v * S_v + h_idx * S_v * S_v;
-    const int64_t state_out_offset     = (sequence * H + h_idx) * S_v * S_v;
+    // [TAG_RS_REPLAY] slot 0 at the row the table names, else at the sequence's consecutive row
+    const int64_t state_out_offset     = (snap_seqs.ids != nullptr ? (int64_t) snap_seqs.ids[sequence] * snap_seqs.row : sequence * H * S_v * S_v) + h_idx * S_v * S_v;
     state += state_out_offset;
     float * snap_l = snap + sequence * snap_seq_stride + h_idx * S_v * S_v;
     curr_state += state_in_offset + col * S_v;
@@ -320,7 +321,7 @@ gated_delta_net_staged_cuda(const float * q,
     float * attn_data = dst;
 
     const int64_t state_in_offset  = sequence * H * S_v * S_v + h_idx * S_v * S_v;
-    const int64_t state_out_offset = (sequence * H + h_idx) * S_v * S_v;
+    const int64_t state_out_offset = (snap_seqs.ids != nullptr ? (int64_t) snap_seqs.ids[sequence] * snap_seqs.row : sequence * H * S_v * S_v) + h_idx * S_v * S_v; // [TAG_RS_REPLAY]
     state += state_out_offset;
     float * snap_l = snap + sequence * snap_seq_stride + h_idx * S_v * S_v;
     curr_state += state_in_offset + col * S_v;
@@ -545,6 +546,10 @@ static ggml_cuda_gdn_snap_seqs gdn_snap_seq_one(const ggml_cuda_gdn_snap_seqs & 
     ggml_cuda_gdn_snap_seqs one = {};
     if (all.p[0] != nullptr) {
         one.p[0] = all.p[seq];
+    }
+    if (all.ids != nullptr) {
+        one.ids = all.ids + seq; // [TAG_RS_REPLAY] the one sequence reads its own entry
+        one.row = all.row;
     }
     return one;
 }
@@ -776,6 +781,10 @@ static void ggml_cuda_op_gated_delta_net_impl(
         GGML_ASSERT(off >= 0 && off % fd.state_row == 0 && cache->slot_stride % fd.state_row == 0 && fd.n_ids == n_seqs);
         fd.head_row  = off / fd.state_row;
         fd.slot_rows = cache->slot_stride / fd.state_row;
+        if (cache->snap_seqs.ids != nullptr) {
+            GGML_ASSERT(cache->snap_seqs.row == fd.state_row); // [TAG_RS_REPLAY] the rows the fused write names, for the hazard check
+            fd.slot0_ids = cache->snap_seqs.ids;
+        }
         if (cache->snap_seqs.p[0] != nullptr) {
             GGML_ASSERT(n_seqs <= GGML_CUDA_GDN_MAX_SEQS);
             fd.snap_seq_on = true;

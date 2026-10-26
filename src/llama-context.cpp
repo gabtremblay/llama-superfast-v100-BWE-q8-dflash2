@@ -426,7 +426,11 @@ llama_context::llama_context(
         if (auto * h = dynamic_cast<llama_memory_hybrid *>(memory.get())) {
             if (auto * r = h->get_mem_recr()) {
                 r->rs_replay_fn   = [this](llama_seq_id s, uint32_t k, uint32_t row) { return rs_replay(s, k, row); };
-                r->rs_rollback_fn = [this](llama_seq_id s) { rs_replay_one(s); };
+                // the eager replay (LLAMA_RS_REPLAY_EAGER=1): one graph a rollback, from seq_rm; the default replays every
+                // pending rollback in one graph before the next decode
+                if (getenv("LLAMA_RS_REPLAY_EAGER") != nullptr && atoi(getenv("LLAMA_RS_REPLAY_EAGER")) != 0) {
+                    r->rs_rollback_fn = [this](llama_seq_id s) { rs_replay_one(s); };
+                }
             }
         }
     }
@@ -2843,6 +2847,18 @@ uint32_t llama_context::kv_room(llama_seq_id seq_id) const {
 
 // [TAG_KV_COMPACT] llama_kv_cache::seq_compact for a batch of one sequence in a unified cache
 // [TAG_RS_REPLAY]
+// [TAG_RS_REPLAY] few graph shapes: a replay's length is rounded up to a multiple of 4 (the shorter ones padded), so a
+// (length, sequence count) graph is built once and its CUDA graph reused from then on, and a whole rollback (0 tokens)
+// replays in the graph too. A slot moves its state row several times, so a sequence without a rollback takes none.
+// LLAMA_RS_REPLAY_SHAPES=1: one graph a (length, sequences) shape, whole rollbacks copied
+static bool rs_replay_one_shape() {
+    static const bool one = [] {
+        const char * e = getenv("LLAMA_RS_REPLAY_SHAPES");
+        return e == nullptr || atoi(e) == 0;
+    }();
+    return one;
+}
+
 // [TAG_RS_REPLAY] one sequence's pending rollback, replayed now (from seq_rm: the graph runs while the caller's host work goes on)
 void llama_context::rs_replay_one(llama_seq_id s) {
     auto * h = dynamic_cast<llama_memory_hybrid *>(memory.get());
@@ -2885,12 +2901,15 @@ void llama_context::rs_replay_pending(const llama_batch & b) {
         return;
     }
     static const bool rlog = getenv("LLAMA_RS_POOL_LOG") != nullptr;
+    const bool one_shape = rs_replay_one_shape();
     // every sequence with a pending rollback, not only the batch's: the recurrent range of a batch covers the cells between
-    // its sequences' cells, and the graph's state copies read those sequences' live rows too. The whole rollbacks are copies
-    // of the kept row; the others replay together in one graph
+    // its sequences' cells, and the graph's state copies read those sequences' live rows too. They replay together in one
+    // graph of the ring's length (a whole rollback as 0 tokens: the kept row into the live row); with LLAMA_RS_REPLAY_SHAPES=1
+    // the whole rollbacks are copies of the kept row and the graph's length is the longest replay
     std::vector<llama_seq_id> seqs;
     std::vector<uint32_t>     ks;
     std::vector<uint32_t>     dsts;
+    std::vector<llama_seq_id> pending;
     std::vector<llama_seq_id> copied;
     const int64_t t0 = ggml_time_us();
     for (llama_seq_id s = 0; s < (llama_seq_id) cparams.n_seq_max; ++s) {
@@ -2976,7 +2995,7 @@ void llama_context::rs_replay_pending(const llama_batch & b) {
                 }
             }
         }
-        if (k == 0) {
+        if (k == 0 && !one_shape) {
             synchronize();
             if (!recr->rs_copy_kept(s)) {
                 GGML_ABORT("[TAG_RS_REPLAY] the kept state of sequence %d could not be copied", s);
@@ -2991,17 +3010,18 @@ void llama_context::rs_replay_pending(const llama_batch & b) {
         seqs.push_back(s);
         ks.push_back((uint32_t) k);
         dsts.push_back((uint32_t) cell);
+        pending.push_back(s);
     }
-    if (!seqs.empty() && !rs_replay_batch(seqs, ks, dsts)) {
-        GGML_ABORT("[TAG_RS_REPLAY] the replay of %zu sequences failed", seqs.size());
+    if (!pending.empty() && !rs_replay_batch(seqs, ks, dsts)) {
+        GGML_ABORT("[TAG_RS_REPLAY] the replay of %zu sequences failed", pending.size());
     }
     for (llama_seq_id s : copied) {
         recr->rs_replay_done(s);
     }
-    for (llama_seq_id s : seqs) {
+    for (llama_seq_id s : pending) {
         recr->rs_replay_done(s);
     }
-    if (!seqs.empty() || !copied.empty()) {
+    if (!pending.empty() || !copied.empty()) {
         ggml_rt_label(this, (int) b.n_tokens);
         const int64_t dt = ggml_time_us() - t0;
         rs_replay_n  += 1;
@@ -3009,13 +3029,15 @@ void llama_context::rs_replay_pending(const llama_batch & b) {
         if (rlog) {
             std::string what;
             for (size_t i = 0; i < seqs.size(); ++i) {
-                what += format(" %d:%u", seqs[i], ks[i]);
+                if (std::find(pending.begin(), pending.end(), seqs[i]) != pending.end()) {
+                    what += format(" %d:%u", seqs[i], ks[i]);
+                }
             }
             for (llama_seq_id s : copied) {
                 what += format(" %d:copy", s);
             }
             LLAMA_LOG_WARN("rs replay:%s, %.2f ms (prep %.2f, graph %.2f, post %.2f) %s (%lld replays, %.2f ms mean)" "\n", what.c_str(), dt/1000.0,
-                    rs_replay_t_prep/1000.0, rs_replay_t_pu/1000.0, rs_replay_t_post/1000.0, seqs.empty() ? "copy" : rs_replay_last_reused ? "reused" : "REBUILT",
+                    rs_replay_t_prep/1000.0, rs_replay_t_pu/1000.0, rs_replay_t_post/1000.0, pending.empty() ? "copy" : rs_replay_last_reused ? "reused" : "REBUILT",
                     (long long) rs_replay_n, rs_replay_us/1000.0/std::max<int64_t>(1, rs_replay_n));
         }
     }
@@ -3024,6 +3046,7 @@ void llama_context::rs_replay_pending(const llama_batch & b) {
 bool llama_context::rs_replay(llama_seq_id seq_id, uint32_t k, uint32_t dst_row) {
     return rs_replay_batch({ seq_id }, { k }, { dst_row });
 }
+
 bool llama_context::rs_replay_batch(const std::vector<llama_seq_id> & seqs, const std::vector<uint32_t> & ks, const std::vector<uint32_t> & dst_rows) {
     auto * h = dynamic_cast<llama_memory_hybrid *>(memory.get());
     llama_memory_recurrent * recr = h ? h->get_mem_recr() : nullptr;
@@ -3034,11 +3057,19 @@ bool llama_context::rs_replay_batch(const std::vector<llama_seq_id> & seqs, cons
     uint32_t k = 0; // the longest replay: the ubatch's tokens a sequence
     std::vector<uint32_t> src_rows(N);
     for (uint32_t i = 0; i < N; ++i) {
-        if (ks[i] == 0 || ks[i] > recr->rs_replay || seqs[i] < 0 || seqs[i] >= LLAMA_MAX_SEQ) {
+        if (ks[i] > recr->rs_replay || seqs[i] < 0 || seqs[i] >= LLAMA_MAX_SEQ) {
             return false;
         }
         k = std::max(k, ks[i]);
         src_rows[i] = recr->rs_bak_row(seqs[i]);
+    }
+    if (rs_replay_one_shape()) {
+        // few shapes: the length rounded up to a multiple of 4 (the kernel is serial over the tokens, so a replay padded to
+        // the ring's 8 costs twice a 4-token one; two lengths a sequence count, at most 8 graphs)
+        k = std::min<uint32_t>(recr->rs_replay, (std::max<uint32_t>(k, 1) + 3) / 4 * 4);
+    }
+    if (k == 0) {
+        return false;
     }
     const int64_t t_a = ggml_time_us();
     // the ubatch: k tokens, owning its data (the graph reuse check wants that) and naming sequence 0 whichever sequence

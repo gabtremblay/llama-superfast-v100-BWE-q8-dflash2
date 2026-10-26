@@ -801,13 +801,19 @@ void llama_model_qwen35::graph::build_layer_rs_replay(llm_graph_input_rs * inp, 
     GGML_ASSERT(M > 0 && k >= 1 && (uint32_t) k <= M);
 
     ggml_tensor * x_all = mctx_cur->get_x_l(il);
-    ggml_tensor * g_all = mctx_cur->get_g_l(il);
-    ggml_tensor * b_all = mctx_cur->get_b_l(il);
-    GGML_ASSERT(x_all != nullptr && g_all != nullptr && b_all != nullptr);
+    ggml_tensor * ab_all = mctx_cur->get_ab_l(il);
+    GGML_ASSERT(x_all != nullptr && ab_all != nullptr);
     GGML_ASSERT(inp->replay_rows != nullptr && inp->replay_rows->ne[0] == k * n_seqs);
     ggml_tensor * qkv_mixed = ggml_reshape_3d(ctx0, ggml_get_rows(ctx0, x_all, inp->replay_rows), x_all->ne[0], k, n_seqs);
-    ggml_tensor * gate      = ggml_reshape_4d(ctx0, ggml_get_rows(ctx0, g_all, inp->replay_rows), 1, num_v_heads, k, n_seqs);
-    ggml_tensor * beta      = ggml_reshape_4d(ctx0, ggml_get_rows(ctx0, b_all, inp->replay_rows), 1, num_v_heads, k, n_seqs);
+    // the gate and beta from the raw rows, as the forward builds them from its merged product (the same ops, so the CUDA
+    // planner folds them into the gated_delta_net launch and the values are the forward's bit for bit)
+    ggml_tensor * ab = ggml_get_rows(ctx0, ab_all, inp->replay_rows); // [2H, k*n_seqs]
+    const size_t es_ab = ggml_element_size(ab);
+    ggml_tensor * beta = ggml_view_4d(ctx0, ab, 1, num_v_heads, k, n_seqs, es_ab, ab->nb[1], ab->nb[1]*k, num_v_heads*es_ab);
+    beta = ggml_sigmoid(ctx0, ggml_cont(ctx0, beta));
+    ggml_tensor * alpha = ggml_view_3d(ctx0, ab, num_v_heads, k, n_seqs, ab->nb[1], ab->nb[1]*k, 0);
+    ggml_tensor * gate  = ggml_mul(ctx0, ggml_softplus(ctx0, ggml_add(ctx0, alpha, layer_w.ssm_dt)), layer_w.ssm_a);
+    gate = ggml_reshape_4d(ctx0, gate, 1, num_v_heads, k, n_seqs);
     cb(qkv_mixed, "rs_replay_qkv_mixed", il);
 
     ggml_tensor * conv_states_all = mctx_cur->get_r_l(il);
@@ -850,7 +856,9 @@ void llama_model_qwen35::graph::build_layer_rs_replay(llm_graph_input_rs * inp, 
     auto attn_out = build_delta_net_fused(q_conv, k_conv, v_conv, gate, beta, state, il);
     ggml_tensor * new_state = attn_out.second;
     cb(new_state, "rs_replay_state", il);
-    ggml_tensor * ns = ggml_reshape_2d(ctx0, ggml_cont(ctx0, new_state), hparams.n_embd_s(), n_seqs);
+    // the op's state view is contiguous: written as it is (a copy of it would move the whole row twice more)
+    ggml_tensor * ns = ggml_is_contiguous(new_state) ? ggml_reshape_2d(ctx0, new_state, hparams.n_embd_s(), n_seqs)
+                                                     : ggml_reshape_2d(ctx0, ggml_cont(ctx0, new_state), hparams.n_embd_s(), n_seqs);
     ggml_build_forward_expand(gf, ggml_set_rows(ctx0, ssm_states_all, ns, inp->replay_dst));
 }
 ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear_half(
@@ -1190,9 +1198,11 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
 
     ggml_tensor * beta;
     ggml_tensor * alpha;
+    ggml_tensor * ab_raw = nullptr; // [TAG_RS_REPLAY] the raw alpha/beta rows [2H, T, B] for the ring
     if (ab_merged) {
         ggml_tensor * ab = ggml_mul_mat(ctx0, ab_w, cur);
         cb(ab, "ab", il);
+        ab_raw = ggml_reshape_3d(ctx0, ab, 2*num_v_heads, n_seq_tokens, n_seqs);
         if (gdn_adj) {
             ggml_build_forward_expand(gf, ab);
         }
@@ -1209,6 +1219,10 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
         alpha = build_lora_mm(layer_w.ssm_alpha, cur, layer_w.ssm_alpha_s);
         ggml_build_forward_expand(gf, beta);
         ggml_build_forward_expand(gf, alpha);
+        if (inp->rs_replay > 0 && !inp->replay_graph) {
+            ab_raw = ggml_concat(ctx0, ggml_reshape_3d(ctx0, alpha, num_v_heads, n_seq_tokens, n_seqs),
+                                       ggml_reshape_3d(ctx0, beta,  num_v_heads, n_seq_tokens, n_seqs), 0);
+        }
         beta = ggml_reshape_4d(ctx0, beta, 1, num_v_heads, n_seq_tokens, n_seqs);
     }
     cb(beta, "beta", il);
@@ -1233,10 +1247,10 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
     ggml_tensor * conv_states_all = mctx_cur->get_r_l(il);
     ggml_tensor * ssm_states_all  = mctx_cur->get_s_l(il);
 
-    // [TAG_RS_REPLAY] the last tokens' GDN inputs to the sequence's ring, for a rollback's replay
+    // [TAG_RS_REPLAY] the last tokens' GDN inputs to the sequence's ring, for a rollback's replay (the pre-conv projections
+    // and the raw alpha/beta product: the replay graph rebuilds the gate and beta from them)
     build_rs_ring_write(inp, mctx_cur->get_x_l(il), qkv_mixed, il);
-    build_rs_ring_write(inp, mctx_cur->get_g_l(il), ggml_reshape_3d(ctx0, gate, num_v_heads, n_seq_tokens, n_seqs), il);
-    build_rs_ring_write(inp, mctx_cur->get_b_l(il), ggml_reshape_3d(ctx0, beta, num_v_heads, n_seq_tokens, n_seqs), il);
+    build_rs_ring_write(inp, mctx_cur->get_ab_l(il), ab_raw, il); // the raw rows: the gate and beta chains stay the kernel's folds
 
     ggml_tensor * conv_kernel      = model.layers[il].ssm_conv1d;
     const int64_t conv_kernel_size = conv_kernel->ne[0];

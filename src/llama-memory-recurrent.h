@@ -87,7 +87,7 @@ public:
 
     // [TAG_RS_REPLAY] LLAMA_RS_REPLAY=1 (or =N tokens, at least n_rs_seq + 1): no per-token rollback snapshots. Every write of a
     // sequence keeps the state min(ubatch, N) tokens back in its one pool row (size + seq, slot 1 of the write) and the GDN inputs
-    // of its last N tokens in the rings (x_l: the pre-conv projections, g_l / b_l: the gate and beta), and a rollback of idx tokens
+    // of its last N tokens in the rings (x_l: the pre-conv projections, ab_l: the raw alpha and beta), and a rollback of idx tokens
     // replays the first min(ubatch, N) - idx of them from the kept state into the live row (llama_context::rs_replay, run before
     // the sequence's next graph) instead of reading a snapshot. One scratch row after the pool rows holds a checkpoint's view
     uint32_t rs_replay      = 0;  // tokens kept (0: off)
@@ -197,8 +197,8 @@ public:
     std::vector<ggml_tensor *> p_l;
     // [TAG_RS_REPLAY] the input rings, F32 [C or H, rs_replay * n_seq_max] (null when off or not a recurrent layer)
     std::vector<ggml_tensor *> x_l;
-    std::vector<ggml_tensor *> g_l;
-    std::vector<ggml_tensor *> b_l;
+    std::vector<ggml_tensor *> ab_l; // the raw alpha/beta rows [2H]: alpha, then beta; the pad row is -inf
+    void rs_ring_init_pad();          // the rings' pad row after a clear (x: zero, ab: -inf)
 
 private:
     //const llama_model & model;
@@ -265,8 +265,7 @@ public:
 
     // [TAG_RS_REPLAY]
     ggml_tensor * get_x_l(int32_t il) const;
-    ggml_tensor * get_g_l(int32_t il) const;
-    ggml_tensor * get_b_l(int32_t il) const;
+    ggml_tensor * get_ab_l(int32_t il) const;
     uint32_t      get_rs_replay() const;
     bool          is_replay() const { return replay; }
     const std::vector<uint32_t>     & get_replay_dsts() const { return replay_dsts; }

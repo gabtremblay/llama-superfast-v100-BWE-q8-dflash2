@@ -6,6 +6,10 @@
 #define GGML_CUDA_GDN_MAX_SEQS 8
 struct ggml_cuda_gdn_snap_seqs {
     float * p[GGML_CUDA_GDN_MAX_SEQS];
+    // [TAG_RS_REPLAY] slot 0 of sequence s at state + ids[s]*row instead of state + s*D: a device table (a replay
+    // graph's rows are inputs), null for the consecutive rows
+    const int32_t * ids = nullptr;
+    int64_t         row = 0;
 };
 
 // fused-kernel recurrent-state output; strides in elements. Rollback slot 0 (the live state) of sequence s is at
@@ -57,6 +61,7 @@ struct ggml_cuda_gdn_fold {
     int64_t         snap_row      = -1; // fused cache: the row of sequence 0's slot 1
     int64_t         snap_seq_rows = 1;  // fused cache: rows between the sequences' slot-1 states
     bool            snap_seq_on = false;             // fused cache, per-sequence bases: slot i >= 1 of sequence s at row snap_seq_row[s] + i - 1
+    const int32_t * slot0_ids   = nullptr;           // [TAG_RS_REPLAY] fused cache: slot 0 of sequence s at row slot0_ids[s] (else head_row + s)
     int64_t         snap_seq_row[GGML_CUDA_GDN_MAX_SEQS] = {};
 };
 
@@ -72,7 +77,7 @@ static __device__ __forceinline__ bool gdn_state_hazard(const ggml_cuda_gdn_fold
             if (s2 == s) {
                 continue;
             }
-            hz |= r == fd.head_row + s2; // slot 0
+            hz |= fd.slot0_ids != nullptr ? r == fd.slot0_ids[s2] : r == fd.head_row + s2; // slot 0
             // slots 1 .. n_written - 1 of sequence s2
             if (fd.snap_seq_on) {
                 const int64_t d = r - fd.snap_seq_row[s2];

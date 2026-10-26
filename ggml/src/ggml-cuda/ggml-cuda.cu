@@ -3557,6 +3557,30 @@ static int ggml_cuda_try_gdn_cache_fusion(
         if (ggml_cuda_is_view_or_noop(n)) {
             continue;
         }
+        if (n->op == GGML_OP_SET_ROWS) {
+            // [TAG_RS_REPLAY] a replay graph writes slot 0 (K == 1) to the rows an input names: SET_ROWS(cache, RESHAPE(the
+            // state view), ids). The kernel writes row ids[s] of sequence s itself, reading the device table
+            const ggml_tensor * b     = n->src[0];
+            const ggml_tensor * ids   = n->src[1];
+            const ggml_tensor * cache = n->view_src;
+            if (K == 1 && n_tokens <= GGML_CUDA_GDN_FOLD_MAX_TOKENS && !(n->flags & GGML_TENSOR_FLAG_OUTPUT) &&
+                b != nullptr && ids != nullptr && cache != nullptr && b->view_src == gdn && b->view_offs == tail_off &&
+                ggml_is_contiguous(b) && b->type == GGML_TYPE_F32 && b->ne[0] == D && b->ne[1] == n_seqs && ggml_nelements(b) == D * n_seqs &&
+                cache->type == GGML_TYPE_F32 && cache->data != nullptr && cache->ne[0] == D && cache->nb[0] == sizeof(float) &&
+                cache->nb[1] % sizeof(float) == 0 && n->data == cache->data &&
+                ids->type == GGML_TYPE_I32 && ids->data != nullptr && ggml_nelements(ids) == n_seqs && ggml_is_contiguous(ids) &&
+                n_seqs <= GGML_CUDA_GDN_MAX_SEQS) {
+                fused_state_cpy.data            = (float *) cache->data;
+                fused_state_cpy.slot_stride     = 0;
+                fused_state_cpy.snap            = fused_state_cpy.data;
+                fused_state_cpy.snap_seq_stride = D;
+                fused_state_cpy.snap_seqs       = {};
+                fused_state_cpy.snap_seqs.ids   = (const int32_t *) ids->data;
+                fused_state_cpy.snap_seqs.row   = (int64_t) (cache->nb[1] / sizeof(float));
+                return j - node_idx;
+            }
+            return 0;
+        }
         if (n->op != GGML_OP_CPY || (n->flags & GGML_TENSOR_FLAG_OUTPUT)) {
             return 0;
         }

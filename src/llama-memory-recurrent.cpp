@@ -38,6 +38,7 @@ static size_t rs_n_dev(const std::vector<ggml_tensor *> & r_l, const std::vector
 #include "llama-model.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cassert>
 #include <cstdlib>
 #include <cstring>
@@ -151,8 +152,7 @@ llama_memory_recurrent::llama_memory_recurrent(
     s_l.resize(n_layer);
     p_l.resize(n_layer);
     x_l.resize(n_layer);
-    g_l.resize(n_layer);
-    b_l.resize(n_layer);
+    ab_l.resize(n_layer);
 
     for (int i = 0; i < n_layer; i++) {
         if (filter && !filter(i)) {
@@ -192,11 +192,9 @@ llama_memory_recurrent::llama_memory_recurrent(
             const int64_t Hv = hparams.ssm_dt_rank;
             // one row more, all zero (the buffer is cleared): the pad token of a batched replay
             x_l[i] = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, C,  (int64_t) rs_replay*n_seq_max + 1);
-            g_l[i] = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, Hv, (int64_t) rs_replay*n_seq_max + 1);
-            b_l[i] = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, Hv, (int64_t) rs_replay*n_seq_max + 1);
+            ab_l[i] = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 2*Hv, (int64_t) rs_replay*n_seq_max + 1);
             ggml_format_name(x_l[i], "rs_ring_x_l%d", i);
-            ggml_format_name(g_l[i], "rs_ring_g_l%d", i);
-            ggml_format_name(b_l[i], "rs_ring_b_l%d", i);
+            ggml_format_name(ab_l[i], "rs_ring_ab_l%d", i);
         }
 
         // the PLE history needs its own row: Meta must mirror it while the delta-net conv state next door stays split
@@ -217,6 +215,7 @@ llama_memory_recurrent::llama_memory_recurrent(
         LLAMA_LOG_INFO("%s: %10s RS buffer size = %8.2f MiB\n", __func__, ggml_backend_buffer_name(buf), ggml_backend_buffer_get_size(buf)/1024.0/1024.0);
         ctxs_bufs.emplace_back(std::move(ctx), buf);
     }
+    rs_ring_init_pad();
 
     {
         const size_t memory_size_r = size_r_bytes();
@@ -252,6 +251,9 @@ void llama_memory_recurrent::clear(bool data) {
     if (data) {
         for (auto & [_, buf] : ctxs_bufs) {
             ggml_backend_buffer_clear(buf.get(), 0);
+        }
+        rs_ring_init_pad();
+        {
         }
     }
 
@@ -1837,16 +1839,26 @@ ggml_tensor * llama_memory_recurrent_context::get_s_l(int32_t il) const {
 }
 
 // [TAG_RS_REPLAY]
+// [TAG_RS_REPLAY] the pad row of the alpha/beta ring is -inf (the x ring's stays zero from the clear)
+void llama_memory_recurrent::rs_ring_init_pad() {
+    if (rs_replay == 0) {
+        return;
+    }
+    for (ggml_tensor * t : ab_l) {
+        if (t == nullptr) {
+            continue;
+        }
+        std::vector<float> row((size_t) t->ne[0], -INFINITY);
+        ggml_backend_tensor_set(t, row.data(), (size_t) rs_ring_zero_row() * t->nb[1], row.size() * sizeof(float));
+    }
+}
+
 ggml_tensor * llama_memory_recurrent_context::get_x_l(int32_t il) const {
     return mem->x_l[il];
 }
 
-ggml_tensor * llama_memory_recurrent_context::get_g_l(int32_t il) const {
-    return mem->g_l[il];
-}
-
-ggml_tensor * llama_memory_recurrent_context::get_b_l(int32_t il) const {
-    return mem->b_l[il];
+ggml_tensor * llama_memory_recurrent_context::get_ab_l(int32_t il) const {
+    return mem->ab_l[il];
 }
 
 uint32_t llama_memory_recurrent_context::get_rs_replay() const {
