@@ -2896,6 +2896,44 @@ void llama_context::rs_replay_pending(const llama_batch & b) {
                     }
                     LLAMA_LOG_WARN("rs replay selftest: seq %d, %u tokens replayed: %s (%d tensors differ, first layer %d, max |diff| %g)\n",
                             s, m, n_bad == 0 ? "IDENTICAL" : "DIFFERENT", n_bad, first_bad, (double) max_diff);
+                    // the first recurrent layer: the kept row against the previous step's live row, the rows' magnitudes, and the
+                    // ring's last row against the live conv state's last input column (the step's last token's x)
+                    for (size_t il = 0; il < recr->s_l.size(); ++il) {
+                        ggml_tensor * t = recr->s_l[il];
+                        ggml_tensor * r = recr->r_l[il];
+                        ggml_tensor * x = recr->x_l[il];
+                        if (t == nullptr || r == nullptr || x == nullptr) {
+                            continue;
+                        }
+                        const size_t n = (size_t) t->ne[0];
+                        std::vector<float> live(n), kept(n), rep(n);
+                        ggml_backend_tensor_get(t, live.data(), (size_t) cell * t->nb[1], n*sizeof(float));
+                        ggml_backend_tensor_get(t, kept.data(), (size_t) recr->rs_bak_row(s) * t->nb[1], n*sizeof(float));
+                        ggml_backend_tensor_get(t, rep.data(),  (size_t) recr->rs_scratch_row * t->nb[1], n*sizeof(float));
+                        auto mx = [](const std::vector<float> & v) { float o = 0.0f; for (float e : v) { o = std::max(o, std::fabs(e)); } return o; };
+                        float dprev = -1.0f;
+                        if (rs_selftest_prev[s].size() == n) {
+                            dprev = 0.0f;
+                            for (size_t q = 0; q < n; ++q) { dprev = std::max(dprev, std::fabs(rs_selftest_prev[s][q] - kept[q])); }
+                        }
+                        // conv state r: [kernel-1, channels] row-major (column c of channel ch at c + ch*(kernel-1)); its last
+                        // column is the last token's x, which the ring's row seq*M + m-1 holds
+                        const size_t nr = (size_t) r->ne[0], nc = (size_t) x->ne[0], kc = nr / nc;
+                        std::vector<float> rlive(nr), rrep(nr), xr(nc);
+                        ggml_backend_tensor_get(r, rlive.data(), (size_t) cell * r->nb[1], nr*sizeof(float));
+                        ggml_backend_tensor_get(r, rrep.data(),  (size_t) recr->rs_scratch_row * r->nb[1], nr*sizeof(float));
+                        ggml_backend_tensor_get(x, xr.data(), ((size_t) s * recr->rs_replay + m - 1) * x->nb[1], nc*sizeof(float));
+                        float dring = 0.0f, drconv = 0.0f;
+                        for (size_t ch = 0; ch < nc; ++ch) {
+                            dring  = std::max(dring,  std::fabs(rlive[kc - 1 + ch*kc] - xr[ch]));
+                            drconv = std::max(drconv, std::fabs(rlive[kc - 1 + ch*kc] - rrep[kc - 1 + ch*kc]));
+                        }
+                        LLAMA_LOG_WARN("rs replay selftest: layer %zu: max|live| %g, max|kept| %g, max|replayed| %g, max|ring x| %g; kept vs previous live: %s (%g); ring last row vs live conv last column: %s (%g); replayed conv last column vs live: %s (%g)\n",
+                                il, (double) mx(live), (double) mx(kept), (double) mx(rep), (double) mx(xr),
+                                dprev < 0 ? "no previous" : dprev == 0.0f ? "IDENTICAL" : "DIFFERENT", (double) dprev,
+                                dring == 0.0f ? "IDENTICAL" : "DIFFERENT", (double) dring, drconv == 0.0f ? "IDENTICAL" : "DIFFERENT", (double) drconv);
+                        break;
+                    }
                 } else {
                     LLAMA_LOG_WARN("rs replay selftest: seq %d: no replay (m %u)\n", s, m);
                 }
@@ -2913,6 +2951,19 @@ void llama_context::rs_replay_pending(const llama_batch & b) {
                 GGML_ABORT("[TAG_RS_REPLAY] the replay of %d tokens for sequence %d failed", k, s);
             }
             recr->rs_replay_done(s);
+            if (selftest) {
+                synchronize();
+                for (size_t il = 0; il < recr->s_l.size(); ++il) {
+                    ggml_tensor * t = recr->s_l[il];
+                    if (t == nullptr) {
+                        continue;
+                    }
+                    const int32_t cell2 = recr->seq_cell(s);
+                    rs_selftest_prev[s].resize((size_t) t->ne[0]);
+                    ggml_backend_tensor_get(t, rs_selftest_prev[s].data(), (size_t) cell2 * t->nb[1], (size_t) t->ne[0]*sizeof(float));
+                    break;
+                }
+            }
             const int64_t dt = ggml_time_us() - t0;
             rs_replay_n  += 1;
             rs_replay_us += dt;

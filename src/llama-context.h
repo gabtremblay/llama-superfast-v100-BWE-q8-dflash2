@@ -679,6 +679,7 @@ private:
     std::vector<int32_t>        rs_ub_seqidx;
     std::vector<int8_t>         rs_ub_out;
     llama_seq_id                rs_ub_seq = 0;
+    std::vector<float>          rs_selftest_prev[LLAMA_MAX_SEQ]; // LLAMA_RS_REPLAY_SELFTEST: the live row after each step
     llm_graph_result_ptr   gf_res_inj;
     llm_graph_result *     gf_res_inj_active = nullptr;
     bool                   inj_arena = false; // the injection's scheduler and arena are swapped in
