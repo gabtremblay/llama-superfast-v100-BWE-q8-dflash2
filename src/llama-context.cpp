@@ -2894,12 +2894,10 @@ void llama_context::rs_replay_pending(const llama_batch & b) {
                             }
                         }
                     }
-                    LLAMA_LOG_WARN("rs replay selftest: seq %d, %u tokens replayed: %s (%d tensors differ, first layer %d, max |diff| %g)
-",
+                    LLAMA_LOG_WARN("rs replay selftest: seq %d, %u tokens replayed: %s (%d tensors differ, first layer %d, max |diff| %g)\n",
                             s, m, n_bad == 0 ? "IDENTICAL" : "DIFFERENT", n_bad, first_bad, (double) max_diff);
                 } else {
-                    LLAMA_LOG_WARN("rs replay selftest: seq %d: no replay (m %u)
-", s, m);
+                    LLAMA_LOG_WARN("rs replay selftest: seq %d: no replay (m %u)\n", s, m);
                 }
             }
             const int64_t t0 = ggml_time_us();
