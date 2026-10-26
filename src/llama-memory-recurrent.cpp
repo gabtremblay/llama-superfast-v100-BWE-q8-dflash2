@@ -645,6 +645,96 @@ bool llama_memory_recurrent::rs_copy_kept(llama_seq_id seq_id) {
     return rs_copy_row_to_live(seq_id, rs_bak_row(seq_id));
 }
 
+// [TAG_RS_JOB_TOP] rows row_src -> row_dst of every layer's state tensors, with the backend copy (the caller synchronized the device)
+bool llama_memory_recurrent::rs_copy_rows(uint32_t row_src, uint32_t row_dst) {
+    if (row_src == row_dst) {
+        return true;
+    }
+    const size_t n_views = 2*3*r_l.size()*rs_n_dev(r_l, s_l);
+    if (!bak_view_ctx || ggml_get_mem_size(bak_view_ctx.get()) < n_views*ggml_tensor_overhead()) {
+        ggml_init_params ip = { n_views*ggml_tensor_overhead(), nullptr, true };
+        bak_view_ctx.reset(ggml_init(ip));
+    } else {
+        ggml_reset(bak_view_ctx.get());
+    }
+    ggml_context * vctx = bak_view_ctx.get();
+    auto copy_row = [&](ggml_tensor * t) {
+        if (t == nullptr) {
+            return;
+        }
+        for (ggml_tensor * td : rs_dev_tensors(t)) {
+            ggml_tensor * vs = ggml_view_1d(vctx, td, td->ne[0], (size_t) row_src*td->nb[1]);
+            ggml_tensor * vd = ggml_view_1d(vctx, td, td->ne[0], (size_t) row_dst*td->nb[1]);
+            ggml_backend_view_init(vs);
+            ggml_backend_view_init(vd);
+            ggml_backend_tensor_copy(vs, vd);
+        }
+    };
+    for (size_t il = 0; il < r_l.size(); ++il) {
+        copy_row(r_l[il]);
+        copy_row(s_l[il]);
+        copy_row(p_l[il]);
+    }
+    return true;
+}
+
+// [TAG_RS_JOB_TOP] the sequence's cell becomes cell dst: its metadata moves and its state row is copied there; a sequence
+// already at dst steps aside to an empty cell first (its row copied too). A sequence with no cell yet claims dst, empty.
+// Between a batch's apply and the next find_slot every cell's state is in its own row (src == the cell), which this relies on
+bool llama_memory_recurrent::rs_move_seq(llama_seq_id seq_id, uint32_t dst) {
+    if (seq_id < 0 || (uint32_t) seq_id >= size || (uint32_t) seq_id >= n_seq_max || dst >= size) {
+        return false;
+    }
+    auto move_cell = [&](uint32_t from, uint32_t to) {
+        auto & cf = cells[from];
+        auto & ct = cells[to];
+        GGML_ASSERT(ct.is_empty());
+        if (cf.src >= 0) {
+            GGML_ASSERT((uint32_t) cf.src == from && "a cell's state must be in its own row to move it");
+            rs_copy_rows(from, to);
+            ct.src = (int32_t) to;
+        } else {
+            ct.src = -1;
+        }
+        ct.pos    = cf.pos;
+        ct.n_last = cf.n_last;
+        ct.seq_id = cf.seq_id;
+        for (llama_seq_id q : ct.seq_id) {
+            cells[q].tail = (int32_t) to;
+        }
+        cf.pos = -1;
+        cf.src = -1;
+        cf.n_last = 0;
+        cf.seq_id.clear();
+    };
+    const int32_t tail = cells[seq_id].tail;
+    if (tail >= 0 && (uint32_t) tail == dst) {
+        return true;
+    }
+    if (!cells[dst].is_empty()) {
+        // the sequence at dst steps aside to an empty cell
+        int32_t e = -1;
+        for (uint32_t i = 0; i < size; ++i) {
+            if (cells[i].is_empty() && (int32_t) i != tail) {
+                e = (int32_t) i;
+                break;
+            }
+        }
+        if (e < 0) {
+            return false;
+        }
+        move_cell(dst, (uint32_t) e);
+    }
+    if (tail < 0) {
+        // no cell yet: claim dst, empty (find_slot keeps a sequence's own cell)
+        cells[dst].seq_id.insert(seq_id);
+        cells[seq_id].tail = (int32_t) dst;
+        used = std::count_if(cells.begin(), cells.end(), [](const mem_cell & cell){ return !cell.is_empty(); });
+        return true;
+    }
+    move_cell((uint32_t) tail, dst);
+    return true;
+}
 bool llama_memory_recurrent::rs_copy_row_to_live(llama_seq_id seq_id, uint32_t row_src) {
     const int32_t tail = seq_cell(seq_id);
     if (tail < 0 || !cells[tail].has_seq_id(seq_id)) {
@@ -987,53 +1077,6 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
         }
         if (min > seq_meta.tail) { min = seq_meta.tail; }
         if (max < seq_meta.tail) { max = seq_meta.tail; }
-    }
-
-    // [TAG_RS_LOCK_RANGE] the gather below moves the ubatch's cells into [min, min + n_seqs): never over a locked cell (a
-    // prompt job's, rs_lock, whose groups keep writing that storage cell between the other sequences' decodes; the next
-    // decode would copy another sequence's state over it, and the job's hash check aborts). With the spare cell
-    // ([TAG_RS_SPARE]) a run of n_seqs cells beside the locked one exists; the cells in its way go to the ubatch
-    // sequences' old places
-    {
-        auto locked_in = [&](int32_t lo) {
-            for (uint32_t s = 0; s < rs_lock.size(); ++s) {
-                if (!rs_lock[s] || s >= size) {
-                    continue;
-                }
-                const int32_t t = cells[s].tail;
-                if (t < lo || t >= lo + (int32_t) n_seqs) {
-                    continue;
-                }
-                bool in_ubatch = false;
-                for (uint32_t u = 0; u < n_seqs && !in_ubatch; ++u) {
-                    in_ubatch = ubatch.seq_id[u*n_seq_tokens][0] == (llama_seq_id) s;
-                }
-                if (!in_ubatch) {
-                    return true;
-                }
-            }
-            return false;
-        };
-        if (locked_in(min)) {
-            int32_t pick = -1;
-            for (int32_t lo = 0; lo + (int32_t) n_seqs <= (int32_t) size; ++lo) {
-                if (!locked_in(lo)) {
-                    pick = lo;
-                    break;
-                }
-            }
-            if (pick < 0) {
-                LLAMA_LOG_ERROR("%s: no run of %u cells beside a prompt job's cell (%u cells; LLAMA_RS_SPARE=0?)\n", __func__, n_seqs, size);
-                return false;
-            }
-            static const bool rlog = getenv("LLAMA_RS_POOL_LOG") != nullptr;
-            if (rlog) {
-                LLAMA_LOG_WARN("%s: %u sequences gathered at cells %d..%d, beside a prompt job's cell (cells %d..%d held it)\n",
-                        __func__, n_seqs, pick, pick + (int32_t) n_seqs - 1, min, min + (int32_t) n_seqs - 1);
-            }
-            min = pick;
-            max = std::max(max, pick + (int32_t) n_seqs - 1);
-        }
     }
 
     // gather and re-order

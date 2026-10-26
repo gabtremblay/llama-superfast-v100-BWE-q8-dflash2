@@ -101,6 +101,10 @@ public:
     void     rs_replay_done(llama_seq_id seq_id);
     bool     rs_copy_kept(llama_seq_id seq_id); // the kept state to the live row (the caller synchronized the device)
     bool     rs_copy_row_to_live(llama_seq_id seq_id, uint32_t row_src);
+    // [TAG_RS_JOB_TOP] a prompt job's sequence moves to the top cell before its groups lock it, so the other sequences'
+    // contiguous runs never straddle it (the caller synchronized the device)
+    bool     rs_copy_rows(uint32_t row_src, uint32_t row_dst);
+    bool     rs_move_seq(llama_seq_id seq_id, uint32_t dst);
 
     // every sequence's wanted depth at once (the plan: see set_rs_depths), or one sequence's; the depth granted is at most
     // n_rs_seq and what the pool's free rows hold, and a prompt job's sequence keeps its run until the job ends
