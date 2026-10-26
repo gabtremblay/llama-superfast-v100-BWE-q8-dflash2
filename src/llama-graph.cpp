@@ -348,6 +348,10 @@ void llm_graph_input_rs::set_input(const llama_ubatch * ubatch) {
     }
 
     set_input_ring(ubatch);
+    if (replay_dst) {
+        GGML_ASSERT(ggml_backend_buffer_is_host(replay_dst->buffer));
+        ((int32_t *) replay_dst->data)[0] = (int32_t) mctx->get_replay_dst();
+    }
 }
 
 
@@ -370,6 +374,7 @@ bool llm_graph_input_rs::can_reuse_ring(const llama_memory_recurrent_context * r
     bool res = true;
     res &= replay_graph == recr->is_replay();
     res &= (ring_idx != nullptr) == (recr->get_rs_replay() > 0 && !recr->is_replay());
+    res &= (replay_dst != nullptr) == recr->is_replay();
     if (ring_idx != nullptr) {
         res &= ring_idx->ne[0] == (int64_t) std::min<uint32_t>(ubatch.n_seq_tokens, rs_replay) * ubatch.n_seqs;
     }
@@ -4094,6 +4099,10 @@ static std::unique_ptr<llm_graph_input_rs> build_rs_inp_impl(
     // [TAG_RS_REPLAY]
     inp->rs_replay    = mctx_cur->get_rs_replay();
     inp->replay_graph = mctx_cur->is_replay();
+    if (inp->replay_graph) {
+        inp->replay_dst = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, 1);
+        ggml_set_input(inp->replay_dst);
+    }
     if (inp->rs_replay > 0 && !inp->replay_graph) {
         inp->ring_m   = std::min<uint32_t>(ubatch.n_seq_tokens, inp->rs_replay);
         inp->ring_idx = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, (int64_t) inp->ring_m * n_seqs);

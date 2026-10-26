@@ -265,6 +265,7 @@ public:
     ggml_tensor * get_b_l(int32_t il) const;
     uint32_t      get_rs_replay() const;
     bool          is_replay() const { return replay; }
+    uint32_t      get_replay_dst() const { return replay_dst; }
     // a replay graph's context: one state written at head_row, read from src_row; no ubatch, apply() changes nothing
     llama_memory_recurrent_context(llama_memory_recurrent * mem, uint32_t head_row, uint32_t src_row);
 
@@ -294,7 +295,8 @@ private:
         std::vector<int32_t> s_copy;
     } cap;
 
-    bool replay = false; // [TAG_RS_REPLAY]
+    bool     replay     = false; // [TAG_RS_REPLAY]
+    uint32_t replay_dst = 0;     // the row a replay graph writes (its head stays 0: the row is an input)
 
     const llama_memory_status status;
 

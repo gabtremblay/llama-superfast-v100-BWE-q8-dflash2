@@ -3004,16 +3004,24 @@ bool llama_context::rs_replay(llama_seq_id seq_id, uint32_t k, uint32_t dst_row)
 
     llama_memory_recurrent_context rctx(recr, dst_row, recr->rs_bak_row(seq_id));
 
-    if (!sched_rs) {
-        const size_t max_nodes = this->graph_max_nodes(std::min(cparams.n_ctx, cparams.n_ubatch));
-        sched_rs.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, false, cparams.op_offload));
-        sched_own_events(sched_rs.get());
-        gf_res_rs.reset(new llm_graph_result(gf_res_reserve->get_max_nodes()));
-        LLAMA_LOG_INFO("%s: the replay scheduler (sched_rs) is created for the rollbacks' replays (LLAMA_RS_REPLAY)\n", __func__);
+    // one scheduler and graph result a replay length: a length's graph stays allocated, and its second run on is
+    // set_inputs and compute (the row it writes and the row it reads are inputs), under a CUDA graph
+    if (sched_rs_k.size() < recr->rs_replay + 1) {
+        sched_rs_k.resize(recr->rs_replay + 1);
+        gf_res_rs_k.resize(recr->rs_replay + 1);
+        gf_res_rs_active_k.assign(recr->rs_replay + 1, nullptr);
     }
-    std::swap(sched, sched_rs);
-    std::swap(gf_res_prev_active, gf_res_rs_active);
-    gf_res_override = gf_res_rs.get();
+    bool first = false;
+    if (!sched_rs_k[k]) {
+        const size_t max_nodes = this->graph_max_nodes(std::min(cparams.n_ctx, cparams.n_ubatch));
+        sched_rs_k[k].reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, false, cparams.op_offload));
+        sched_own_events(sched_rs_k[k].get());
+        gf_res_rs_k[k].reset(new llm_graph_result(gf_res_reserve->get_max_nodes()));
+        first = true;
+    }
+    std::swap(sched, sched_rs_k[k]);
+    std::swap(gf_res_prev_active, gf_res_rs_active_k[k]);
+    gf_res_override = gf_res_rs_k[k].get();
     const uint32_t n_outputs_save = n_outputs;
     n_outputs = 0;
 
@@ -3022,8 +3030,18 @@ bool llama_context::rs_replay(llama_seq_id seq_id, uint32_t k, uint32_t dst_row)
 
     n_outputs = n_outputs_save;
     gf_res_override = nullptr;
-    std::swap(gf_res_prev_active, gf_res_rs_active);
-    std::swap(sched, sched_rs);
+    if (first) {
+        std::string bufs;
+        for (size_t i = 0; i < backend_ptrs.size(); ++i) {
+            const size_t sz = ggml_backend_sched_get_buffer_size(sched.get(), backend_ptrs[i]);
+            if (sz > 0) {
+                bufs += format(" %s %.2f MiB", ggml_backend_buft_name(backend_buft[i]), sz/1024.0/1024.0);
+            }
+        }
+        LLAMA_LOG_INFO("%s: replay scheduler for %u tokens (LLAMA_RS_REPLAY): compute buffers%s\n", __func__, k, bufs.c_str());
+    }
+    std::swap(gf_res_prev_active, gf_res_rs_active_k[k]);
+    std::swap(sched, sched_rs_k[k]);
     return res != nullptr && st == GGML_STATUS_SUCCESS;
 }
 

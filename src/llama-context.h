@@ -665,9 +665,9 @@ private:
     ggml_backend_sched_ptr sched_inj;
 
     // [TAG_RS_REPLAY] the replay graphs' scheduler and graph result, so the decode's graph stays allocated and reusable
-    ggml_backend_sched_ptr sched_rs;
-    llm_graph_result_ptr   gf_res_rs;
-    llm_graph_result *     gf_res_rs_active   = nullptr;
+    std::vector<ggml_backend_sched_ptr> sched_rs_k;        // by replay length, so each graph stays allocated and reusable
+    std::vector<llm_graph_result_ptr>   gf_res_rs_k;
+    std::vector<llm_graph_result *>     gf_res_rs_active_k;
     llm_graph_result *     gf_res_override    = nullptr;
     int64_t                rs_replay_n        = 0;
     int64_t                rs_replay_us       = 0;

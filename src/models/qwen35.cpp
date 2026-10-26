@@ -850,11 +850,8 @@ void llama_model_qwen35::graph::build_layer_rs_replay(llm_graph_input_rs * inp, 
     auto attn_out = build_delta_net_fused(q_conv, k_conv, v_conv, gate, beta, state, il);
     ggml_tensor * new_state = attn_out.second;
     cb(new_state, "rs_replay_state", il);
-    const auto kv_head = mctx_cur->get_head();
-    ggml_build_forward_expand(gf,
-            ggml_cpy(ctx0, new_state,
-                ggml_view_2d(ctx0, ssm_states_all, hparams.n_embd_s(), n_seqs, ssm_states_all->nb[1],
-                    kv_head * hparams.n_embd_s() * ggml_element_size(ssm_states_all))));
+    ggml_tensor * ns = ggml_reshape_2d(ctx0, ggml_cont(ctx0, new_state), hparams.n_embd_s(), n_seqs);
+    ggml_build_forward_expand(gf, ggml_set_rows(ctx0, ssm_states_all, ns, inp->replay_dst));
 }
 
 ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear_half(

@@ -487,6 +487,13 @@ ggml_tensor * llm_build_delta_net_base::build_conv_state(
                     ggml_row_size(conv_input->type, s_idx));
         cb(conv_state_last, "conv_state_last", il);
 
+        if (inp->replay_graph) {
+            // [TAG_RS_REPLAY] to the row the input names, so the graph is the same whichever sequence replays
+            ggml_tensor * last = ggml_reshape_2d(ctx0, ggml_cont(ctx0, conv_state_last), row_count, n_seqs);
+            ggml_build_forward_expand(gf, ggml_set_rows(ctx0, conv_states_all, last, inp->replay_dst));
+            return conv_input;
+        }
+
         ggml_tensor * conv_state_update =
             ggml_view_2d(ctx0, conv_states_all,
                     row_count, n_seqs, conv_states_all->nb[1],

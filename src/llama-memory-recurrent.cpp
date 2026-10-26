@@ -1853,8 +1853,9 @@ uint32_t llama_memory_recurrent_context::get_rs_replay() const {
 llama_memory_recurrent_context::llama_memory_recurrent_context(llama_memory_recurrent * mem, uint32_t head_row, uint32_t src_row) :
         status(LLAMA_MEMORY_STATUS_NO_UPDATE), mem(mem) {
     replay     = true;
+    replay_dst = head_row;
     cap.on     = true;
-    cap.head   = head_row;
+    cap.head   = 0;
     cap.n      = 1;
     cap.rs_z   = -1;
     cap.seq    = -1;
