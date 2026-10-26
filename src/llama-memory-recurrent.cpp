@@ -305,6 +305,9 @@ bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos
                 if (!pending && rollback >= 1 && rollback <= (llama_pos) get_rs_depth(seq_id)) {
                     set_rs_idx(seq_id, (uint32_t) rollback);
                     cell.pos = p0 - 1;
+                    if (rs_replay > 0 && rs_rollback_fn) {
+                        rs_rollback_fn(seq_id); // [TAG_RS_REPLAY] eager
+                    }
                     return true;
                 }
                 // [TAG_SPEC_PIPELINE] past the last ubatch, into the one before it: read the backup of its snapshots,

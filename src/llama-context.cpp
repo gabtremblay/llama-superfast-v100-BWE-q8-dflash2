@@ -425,7 +425,8 @@ llama_context::llama_context(
         // [TAG_RS_REPLAY] a checkpoint's view replays through the context
         if (auto * h = dynamic_cast<llama_memory_hybrid *>(memory.get())) {
             if (auto * r = h->get_mem_recr()) {
-                r->rs_replay_fn = [this](llama_seq_id s, uint32_t k, uint32_t row) { return rs_replay(s, k, row); };
+                r->rs_replay_fn   = [this](llama_seq_id s, uint32_t k, uint32_t row) { return rs_replay(s, k, row); };
+                r->rs_rollback_fn = [this](llama_seq_id s) { rs_replay_one(s); };
             }
         }
     }
@@ -2842,6 +2843,41 @@ uint32_t llama_context::kv_room(llama_seq_id seq_id) const {
 
 // [TAG_KV_COMPACT] llama_kv_cache::seq_compact for a batch of one sequence in a unified cache
 // [TAG_RS_REPLAY]
+// [TAG_RS_REPLAY] one sequence's pending rollback, replayed now (from seq_rm: the graph runs while the caller's host work goes on)
+void llama_context::rs_replay_one(llama_seq_id s) {
+    auto * h = dynamic_cast<llama_memory_hybrid *>(memory.get());
+    llama_memory_recurrent * recr = h ? h->get_mem_recr() : nullptr;
+    if (recr == nullptr || recr->rs_replay == 0) {
+        return;
+    }
+    const int32_t k = recr->rs_replay_pending(s);
+    if (k < 0) {
+        return;
+    }
+    static const bool rlog = getenv("LLAMA_RS_POOL_LOG") != nullptr;
+    const int64_t t0 = ggml_time_us();
+    bool ok;
+    if (k == 0) {
+        synchronize();
+        ok = recr->rs_copy_kept(s);
+    } else {
+        const int32_t cell = recr->seq_cell(s);
+        ok = cell >= 0 && rs_replay(s, (uint32_t) k, (uint32_t) cell);
+    }
+    if (!ok) {
+        GGML_ABORT("[TAG_RS_REPLAY] the eager replay of %d tokens for sequence %d failed", k, s);
+    }
+    recr->rs_replay_done(s);
+    const int64_t dt = ggml_time_us() - t0;
+    rs_replay_n  += 1;
+    rs_replay_us += dt;
+    if (rlog) {
+        LLAMA_LOG_WARN("rs replay (eager): seq %d, %d tokens, %.2f ms (prep %.2f, graph %.2f, post %.2f) %s (%lld replays, %.2f ms mean)\n", s, k, dt/1000.0,
+                rs_replay_t_prep/1000.0, rs_replay_t_pu/1000.0, rs_replay_t_post/1000.0, k == 0 ? "copy" : rs_replay_last_reused ? "reused" : "REBUILT",
+                (long long) rs_replay_n, rs_replay_us/1000.0/std::max<int64_t>(1, rs_replay_n));
+    }
+}
+
 void llama_context::rs_replay_pending(const llama_batch & b) {
     auto * h = dynamic_cast<llama_memory_hybrid *>(memory.get());
     llama_memory_recurrent * recr = h ? h->get_mem_recr() : nullptr;
