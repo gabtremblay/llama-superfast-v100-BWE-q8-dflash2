@@ -1452,7 +1452,8 @@ void llm_graph_result::set_outputs(const llm_graph_params & params) {
         ggml_set_output(t_h_nextn);
     }
     // [TAG_TU_FEAT] a prompt job's group copies its layers' inputs to the job's buffers instead (tu_feat)
-    if (params.tu_mode == LLM_GRAPH_TU_NONE) {
+    // [TAG_RS_REPLAY] a replay graph has no layer inputs
+    if (params.tu_mode == LLM_GRAPH_TU_NONE && params.gtype != LLM_GRAPH_TYPE_RS_REPLAY) {
         const auto & embeddings_layer_inp = params.cparams.embeddings_layer_inp;
         for (size_t il = 0; il < embeddings_layer_inp.size(); ++il) {
             if (embeddings_layer_inp[il]) {
