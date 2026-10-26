@@ -48,9 +48,9 @@ fork runs the [Run](#run) line below.
 | Cold prefill, ~48k-token prompt | 797 tok/s | 831 tok/s |
 | Time to first token, new ~125-token chat turn (median) | 657 ms | 260 ms |
 | Decode, 400 tokens, three prompts | 95 / 93 / 99 tok/s | 91 / 90 / 115 tok/s |
-| Context | 2 concurrent slots of 65,536 each | 4 concurrent slots sharing one 245,760-token pool (`--kv-unified`) |
+| Context | 2 concurrent slots of 65,536 each | 4 concurrent slots sharing one 262,144-token pool (`--kv-unified`) |
 
-Decode on the first two prompts is 3–4% slower, the cost of reading an 8-bit cache, in exchange for 1.9× the context;
+Decode on the first two prompts is 3–4% slower, the cost of reading an 8-bit cache, in exchange for twice the context;
 the third prompt's rate moves with how many draft tokens it accepts (the probe decodes greedily).
 
 Upstream's two-user scheduler refuses DFlash2 prompt jobs, so there a side request's prompt waits until the other slot
@@ -60,21 +60,22 @@ The same comparison under [BetterBench](https://github.com/bitexploder/betterben
 conversation resident in one slot, the same corpus and sampling for both). Upstream runs with its scheduler off
 (`LLAMA_TU=0`: on, its prompt jobs refuse the DFlash2 draft and long prompts fail) at 2 × 49,152 tokens, the largest
 two-slot context that survived the run: at its 2 × 65,536 the card ran out of memory four minutes in, as its graph
-cache grew under traffic (section 5). This fork runs the [Run](#run) line: four slots, one 245,760-token pool.
+cache grew under traffic (section 5). This fork runs the [Run](#run) line: four slots, one 262,144-token pool.
 
-| BetterBench | Upstream, f16 KV, 2 × 49,152 | This fork, `q8_0` KV, 4 slots on 245,760 |
+| BetterBench | Upstream, f16 KV, 2 × 49,152 | This fork, `q8_0` KV, 4 slots on 262,144 |
 |---|---|---|
-| Single-stream decode (weighted median) | 108.9 tok/s | 104.5 tok/s |
-| Time to first token, single stream (p50) | 610 ms | 190 ms |
-| Cold prefill, 12k / 24k / 47k-token prompts | 877 / 858 / 795 tok/s | 961 / 915 / 830 tok/s |
-| Aggregate decode, 1 / 2 / 4 requests in flight | 90 / 101 / 89 tok/s | 92 / 99 / 154 tok/s |
-| Time to first token with 2 / 4 in flight (p50) | 2.3 s / 12.1 s | 0.37 s / 0.42 s |
-| Peak VRAM over the run | 31,044 MiB at 98,304 tokens | 32,266 MiB at 245,760 tokens |
+| Single-stream decode (weighted median) | 108.9 tok/s | 101.1 tok/s |
+| Time to first token, single stream (p50) | 610 ms | 191 ms |
+| Cold prefill, 12k / 24k / 47k-token prompts | 877 / 858 / 795 tok/s | 963 / 915 / 830 tok/s |
+| Aggregate decode, 1 / 2 / 4 / 8 requests in flight | 90 / 101 / 89 / 88 tok/s | 88 / 91 / 158 / 154 tok/s |
+| Time to first token with 2 / 4 / 8 in flight (p50) | 2.3 s / 12.1 s / 32.7 s | 0.36 s / 0.37 s / 9.2 s |
+| Peak VRAM over the run | 31,044 MiB at 98,304 tokens | 32,028 MiB at 262,144 tokens |
 
-A lone stream decodes 4% slower, the cost of the 8-bit cache; everything else is ahead: the first token three times
-sooner, prompts read 5–10% faster, 2.5× the context, and with several requests in flight 1.7× the throughput while the
-fourth request starts in 0.4 s instead of 12 s. The 245,760-token pool peaks at ~32.3 GB of the card's 32.5 over a long
-run of mixed traffic.
+A lone stream decodes 7% slower: the 8-bit cache, and the rollback's replay (section 15) that pays for the context.
+Everything else is ahead: the first token three times sooner, prompts read 5–10% faster, 2.7× the context, and with
+four or eight requests in flight 1.75× the throughput, while the fourth request starts in 0.4 s instead of 12 s and the
+eighth in 9 s instead of 33 s (upstream's two slots serve eight requests four at a time). The 262,144-token pool peaks
+at ~32.0 GB of the card's 32.5 over the run.
 
 ## Build
 
