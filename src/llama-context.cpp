@@ -2849,15 +2849,10 @@ void llama_context::rs_replay_pending(const llama_batch & b) {
         return;
     }
     static const bool rlog = getenv("LLAMA_RS_POOL_LOG") != nullptr;
-    std::vector<llama_seq_id> seen;
-    for (int32_t i = 0; i < b.n_tokens; ++i) {
-        const int32_t n = b.n_seq_id ? b.n_seq_id[i] : 1;
-        for (int32_t j = 0; j < n; ++j) {
-            const llama_seq_id s = b.seq_id ? b.seq_id[i][j] : 0;
-            if (std::find(seen.begin(), seen.end(), s) != seen.end()) {
-                continue;
-            }
-            seen.push_back(s);
+    // every sequence with a pending rollback, not only the batch's: the recurrent range of a batch covers the cells between
+    // its sequences' cells, and the graph's state copies read those sequences' live rows too
+    {
+        for (llama_seq_id s = 0; s < (llama_seq_id) cparams.n_seq_max; ++s) {
             const int32_t k = recr->rs_replay_pending(s);
             if (k < 0) {
                 continue;
