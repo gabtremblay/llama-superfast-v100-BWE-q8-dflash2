@@ -668,6 +668,7 @@ private:
     std::vector<ggml_backend_sched_ptr> sched_rs_k;        // by replay length, so each graph stays allocated and reusable
     std::vector<llm_graph_result_ptr>   gf_res_rs_k;
     std::vector<llm_graph_result *>     gf_res_rs_active_k;
+    bool                                rs_replay_active = false; // a replay graph is being processed: no device syncs for it
     llm_graph_result *     gf_res_override    = nullptr;
     int64_t                rs_replay_n        = 0;
     int64_t                rs_replay_us       = 0;

@@ -1685,7 +1685,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         // that the previous compute is still reading.
         // [TAG_SPEC_PIPELINE] an async decode keeps the copy slot of the decode in flight; the scheduler orders the
         // input copies itself (ggml_backend_sched_set_pipe), and the outputs go to the other output slot
-        if (cparams.pipeline_parallel && !pipe_async) {
+        if (cparams.pipeline_parallel && !pipe_async && !rs_replay_active) { // [TAG_RS_REPLAY] its own scheduler, nothing in flight
             ggml_backend_sched_synchronize(sched.get());
         }
 
@@ -1703,7 +1703,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         // allocated puts the scheduler back on copy 0, as it already does between generation steps; the host reads
         // these graphs' outputs before the next round, so the wait costs nothing there. LLAMA_SCHED_COPY0=0 restores
         // the rotation
-        if (cparams.pipeline_parallel && ubatch.n_tokens <= 32 && sched_copy0() && !pipe_async) {
+        if (cparams.pipeline_parallel && ubatch.n_tokens <= 32 && sched_copy0() && !pipe_async && !rs_replay_active) {
             ggml_backend_sched_synchronize(sched.get());
         }
 
@@ -3026,7 +3026,9 @@ bool llama_context::rs_replay(llama_seq_id seq_id, uint32_t k, uint32_t dst_row)
     n_outputs = 0;
 
     ggml_status st = GGML_STATUS_SUCCESS;
+    rs_replay_active = true;
     llm_graph_result * res = process_ubatch(ub, LLM_GRAPH_TYPE_RS_REPLAY, &rctx, st);
+    rs_replay_active = false;
 
     n_outputs = n_outputs_save;
     gf_res_override = nullptr;
