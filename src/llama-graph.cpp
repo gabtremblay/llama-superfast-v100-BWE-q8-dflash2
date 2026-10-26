@@ -347,7 +347,12 @@ void llm_graph_input_rs::set_input(const llama_ubatch * ubatch) {
         }
     }
 
-    // [TAG_RS_REPLAY] the ring rows of each sequence's last ring_m tokens
+    set_input_ring(ubatch);
+}
+
+
+// [TAG_RS_REPLAY] the ring rows of each sequence's last ring_m tokens (the hybrid inputs fill s_copy themselves and call this)
+void llm_graph_input_rs::set_input_ring(const llama_ubatch * ubatch) {
     if (ring_idx) {
         GGML_ASSERT(ggml_backend_buffer_is_host(ring_idx->buffer));
         GGML_ASSERT(ring_idx->ne[0] == (int64_t) ring_m * ubatch->n_seqs);
@@ -359,6 +364,16 @@ void llm_graph_input_rs::set_input(const llama_ubatch * ubatch) {
             }
         }
     }
+}
+
+bool llm_graph_input_rs::can_reuse_ring(const llama_memory_recurrent_context * recr, const llama_ubatch & ubatch) const {
+    bool res = true;
+    res &= replay_graph == recr->is_replay();
+    res &= (ring_idx != nullptr) == (recr->get_rs_replay() > 0 && !recr->is_replay());
+    if (ring_idx != nullptr) {
+        res &= ring_idx->ne[0] == (int64_t) std::min<uint32_t>(ubatch.n_seq_tokens, rs_replay) * ubatch.n_seqs;
+    }
+    return res;
 }
 
 // [TAG_RS_POOL] the slot-1 row of each of the ubatch's sequences
@@ -397,12 +412,7 @@ bool llm_graph_input_rs::can_reuse(const llm_graph_params & params) {
 
     res &= head == mctx->get_head();
 
-    // [TAG_RS_REPLAY]
-    res &= replay_graph == mctx->is_replay();
-    res &= (ring_idx != nullptr) == (mctx->get_rs_replay() > 0 && !mctx->is_replay());
-    if (ring_idx != nullptr) {
-        res &= ring_idx->ne[0] == (int64_t) std::min<uint32_t>(params.ubatch.n_seq_tokens, rs_replay) * params.ubatch.n_seqs;
-    }
+    res &= can_reuse_ring(mctx, params.ubatch); // [TAG_RS_REPLAY]
     res &= rs_z == mctx->get_rs_z();
 
     // [TAG_RS_POOL] the slot count sizes the writes and the row table (its values are an input)
@@ -1180,6 +1190,8 @@ void llm_graph_input_mem_hybrid::set_input(const llama_ubatch * ubatch) {
         }
     }
 
+
+    inp_rs->set_input_ring(ubatch); // [TAG_RS_REPLAY]
 }
 
 bool llm_graph_input_mem_hybrid::can_reuse(const llm_graph_params & params) {
@@ -1198,6 +1210,7 @@ bool llm_graph_input_mem_hybrid::can_reuse(const llm_graph_params & params) {
 
     res &= inp_rs->s_copy->ne[0] == mctx->get_recr()->get_n_rs();
     res &= inp_rs->can_reuse_snap(mctx->get_recr(), params.ubatch); // [TAG_RS_POOL]
+    res &= inp_rs->can_reuse_ring(mctx->get_recr(), params.ubatch); // [TAG_RS_REPLAY]
 
     res &= inp_rs->s_copy_main->ne[0]  == params.ubatch.n_seqs;
     res &= inp_rs->s_copy_extra->ne[0] == mctx->get_recr()->get_n_rs() - params.ubatch.n_seqs;
@@ -1228,6 +1241,8 @@ void llm_graph_input_mem_hybrid_k::set_input(const llama_ubatch * ubatch) {
         }
     }
 
+
+    inp_rs->set_input_ring(ubatch); // [TAG_RS_REPLAY]
 }
 
 bool llm_graph_input_mem_hybrid_k::can_reuse(const llm_graph_params & params) {
@@ -1243,6 +1258,7 @@ bool llm_graph_input_mem_hybrid_k::can_reuse(const llm_graph_params & params) {
 
     res &= inp_rs->s_copy->ne[0] == mctx->get_recr()->get_n_rs();
     res &= inp_rs->can_reuse_snap(mctx->get_recr(), params.ubatch); // [TAG_RS_POOL]
+    res &= inp_rs->can_reuse_ring(mctx->get_recr(), params.ubatch); // [TAG_RS_REPLAY]
 
     res &= inp_rs->s_copy_main->ne[0]  == params.ubatch.n_seqs;
     res &= inp_rs->s_copy_extra->ne[0] == mctx->get_recr()->get_n_rs() - params.ubatch.n_seqs;
@@ -1303,6 +1319,8 @@ void llm_graph_input_mem_hybrid_iswa::set_input(const llama_ubatch * ubatch) {
             data[i] = mctx->get_recr()->s_copy(i);
         }
     }
+
+    inp_rs->set_input_ring(ubatch); // [TAG_RS_REPLAY]
 }
 
 bool llm_graph_input_mem_hybrid_iswa::can_reuse(const llm_graph_params & params) {

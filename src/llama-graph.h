@@ -283,6 +283,9 @@ public:
 
     // [TAG_RS_POOL] the snapshot rows' reuse check, with the recurrent context given (the hybrid inputs call it with theirs)
     bool can_reuse_snap(const llama_memory_recurrent_context * recr, const llama_ubatch & ubatch) const;
+    // [TAG_RS_REPLAY] the ring row table's fill and reuse check (the hybrid inputs call them too)
+    void set_input_ring(const llama_ubatch * ubatch);
+    bool can_reuse_ring(const llama_memory_recurrent_context * recr, const llama_ubatch & ubatch) const;
 
     ggml_tensor * s_copy;  // I32 [n_rs]
 
