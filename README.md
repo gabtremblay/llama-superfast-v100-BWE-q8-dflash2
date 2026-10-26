@@ -7,11 +7,12 @@ context size. It adds:
 
 - an 8-bit (`q8_0`) KV cache on upstream's fast Volta attention kernels, which with the memory changes below nearly
   doubles the context one 32 GB card holds, for a few percent of decode speed;
-- a unified KV cache (`--kv-unified`) that runs at the split cache's speed, so the slots share one 245,760-token pool, and
-  a prompt's cells kept one run of that pool, so its attention reads only its own cells;
-- four slots in the recurrent memory of two: the rollback snapshots of the draft are one pool the slots share, so a slot
-  alone keeps the full draft depth and four slots fit the same 245,760 tokens (aggregate decode 154 tok/s with four
-  requests in flight, against 91 with two slots);
+- a unified KV cache (`--kv-unified`) that runs at the split cache's speed, so the slots share one 262,144-token pool,
+  the model's whole training context, and a prompt's cells kept one run of that pool, so its attention reads only its
+  own cells;
+- four slots in the recurrent memory of one and a half: the draft's rollback no longer reads a snapshot written per
+  token; each slot keeps one state and the last 8 tokens' inputs, and the accepted tokens are replayed from it, for all
+  slots in one graph (aggregate decode 158.1 tok/s with four requests in flight, against 91 with two slots);
 - upstream's two-user scheduler working with the DFlash2 draft on that unified cache, so a side request's prompt is read
   while the other slot keeps generating instead of waiting for it to finish;
 - faster prefill on upstream's repacked weights, and a faster first token on short prompts;
@@ -124,28 +125,28 @@ repository.
 
 ## Run
 
-One card, four slots, DFlash2, one 245,760-token pool:
+One card, four slots, DFlash2, one 262,144-token pool:
 
 ```bash
-LLAMA_RS_POOL=12 LLAMA_DFLASH2_HEAD_FILE=models/mtp-Qwen3.8-27B-Q4_0.gguf LLAMA_SPEC_DRAFT_VOCAB_FILE=models/draft-vocab-qwen3.8-27b.txt build/bin/llama-server -m models/Qwen3.8-27B-UD-Q4_K_XL.gguf -md models/Qwen3.8-27B-DFlash2-Q4_K_M.gguf --spec-type draft-dflash --spec-draft-n-max 7 --spec-draft-ubatch 512 -c 245760 --parallel 4 --kv-unified -fa on -ngl 99 -ctk q8_0 -ctv q8_0 -ctkd f16 -ctvd f16 -t 12 -b 2048 -ub 2048 --cache-ram 0 --jinja --metrics --temp 1.0 --top-p 0.95 --top-k 20 --host 127.0.0.1 --port 8080
+LLAMA_DFLASH2_HEAD_FILE=models/mtp-Qwen3.8-27B-Q4_0.gguf LLAMA_SPEC_DRAFT_VOCAB_FILE=models/draft-vocab-qwen3.8-27b.txt build/bin/llama-server -m models/Qwen3.8-27B-UD-Q4_K_XL.gguf -md models/Qwen3.8-27B-DFlash2-Q4_K_M.gguf --spec-type draft-dflash --spec-draft-n-max 7 --spec-draft-ubatch 512 -c 262144 --parallel 4 --kv-unified -fa on -ngl 99 -ctk q8_0 -ctv q8_0 -ctkd f16 -ctvd f16 -t 12 -b 2048 -ub 2048 --cache-ram 0 --jinja --metrics --temp 1.0 --top-p 0.95 --top-k 20 --host 127.0.0.1 --port 8080
 ```
 
 The same with the Docker image (models in `$PWD/models`):
 
 ```bash
-docker run -d --name llama-superfast --init --gpus all -p 8080:8080 -v "$PWD/models:/models:ro" -e LLAMA_RS_POOL=12 -e LLAMA_DFLASH2_HEAD_FILE=/models/mtp-Qwen3.8-27B-Q4_0.gguf llama-superfast-v100 --host 0.0.0.0 --port 8080 -m /models/Qwen3.8-27B-UD-Q4_K_XL.gguf -md /models/Qwen3.8-27B-DFlash2-Q4_K_M.gguf --spec-type draft-dflash --spec-draft-n-max 7 --spec-draft-ubatch 512 -c 245760 --parallel 4 --kv-unified -fa on -ngl 99 -ctk q8_0 -ctv q8_0 -ctkd f16 -ctvd f16 -t 12 -b 2048 -ub 2048 --cache-ram 0 --jinja --metrics --temp 1.0 --top-p 0.95 --top-k 20
+docker run -d --name llama-superfast --init --gpus all -p 8080:8080 -v "$PWD/models:/models:ro" -e LLAMA_DFLASH2_HEAD_FILE=/models/mtp-Qwen3.8-27B-Q4_0.gguf llama-superfast-v100 --host 0.0.0.0 --port 8080 -m /models/Qwen3.8-27B-UD-Q4_K_XL.gguf -md /models/Qwen3.8-27B-DFlash2-Q4_K_M.gguf --spec-type draft-dflash --spec-draft-n-max 7 --spec-draft-ubatch 512 -c 262144 --parallel 4 --kv-unified -fa on -ngl 99 -ctk q8_0 -ctv q8_0 -ctkd f16 -ctvd f16 -t 12 -b 2048 -ub 2048 --cache-ram 0 --jinja --metrics --temp 1.0 --top-p 0.95 --top-k 20
 ```
 
 What the settings do:
 
 - The two-user scheduler is on (section 8): a long prompt in one slot no longer stalls the other slots' decode.
   `LLAMA_TU=0` turns it off.
-- `--parallel 4` with `LLAMA_RS_POOL=12` (sections 12 and 13): four slots in the recurrent memory of two. With
-  `--parallel 2`, leave `LLAMA_RS_POOL` unset; two slots take the same memory either way.
+- `--parallel 4` (sections 12 and 15): four slots, each with one kept recurrent state; the draft's rollbacks replay.
+  `LLAMA_RS_REPLAY=0` goes back to the snapshot pool of section 13 (then add `LLAMA_RS_POOL=12` and `-c 245760`).
 - `LLAMA_DFLASH2_HEAD_FILE` points DFlash2's output head at the MTP file's rows.
 - `LLAMA_SPEC_DRAFT_VOCAB_FILE` (set by the Docker image) restricts the draft to the top 98,304 ids of the file's
   131,072-id ranking. Without it, decode is ~5–10% slower.
-- `--kv-unified` gives the slots one 245,760-token pool: any slot can take most of it (one took a 157k-token prompt
+- `--kv-unified` gives the slots one 262,144-token pool: any slot can take most of it (one took a 157k-token prompt
   while another answered side requests). `--kv-unified-per-slot N` caps each slot inside the pool;
   `--no-kv-unified` gives each slot a fixed share (with two slots 2 × 122,880) at the same speed.
 - `-b 2048` equal to `-ub` keeps the DFlash2 features on the GPU during prefill (section 3).
@@ -153,8 +154,8 @@ What the settings do:
 - `--cache-ram 0` turns off the host prompt cache. Saving a slot's state to host memory costs ~220 ms over a slow link
   each time a slot switches conversations; with one user and pinned slots (`id_slot` in the request) the cache brings
   little. On a fast link, try it on.
-- 245,760 tokens with four slots peaks at ~32.3 GB. VRAM keeps growing for the first minutes of real traffic, so size a
-  different context from a long mixed run, not a fill test (section 5).
+- 262,144 tokens with four slots peaks at ~32.0 GB under BetterBench. VRAM keeps growing for the first minutes of real
+  traffic, so size a different context from a long mixed run, not a fill test (section 5).
 
 The host side of this setup — powering an OcuLink eGPU dock from a USB relay, training the PCIe link through an S3
 suspend, loading the driver with the 200 W cap, and cooling the passive card with a PWM fan driven from its
@@ -162,7 +163,7 @@ temperature, as systemd units an inference service chains after — is published
 [v100-egpu-host](https://github.com/gabtremblay/v100-egpu-host), with the bill of materials.
 
 Check the startup log for `two-user scheduling (LLAMA_TU): on`, the draft model loading, and
-`n_slots = 4, n_ctx_slot = 245760`. Draft acceptance on this target is ~0.5; near zero means the draft did not load.
+`n_slots = 4, n_ctx_slot = 262144`. Draft acceptance on this target is ~0.5; near zero means the draft did not load.
 
 For MTP instead of DFlash2: `-md models/mtp-Qwen3.8-27B-Q4_0.gguf --spec-type draft-mtp`, without
 `LLAMA_DFLASH2_HEAD_FILE` or `--spec-draft-ubatch`. It decodes slower here.
@@ -432,14 +433,42 @@ of section 11 skipped those prefixes (its 1,024-cell cap).
 - BetterBench's prefill sweep on four slots: 12k / 24k / 47k tokens 961 / 915 / 830 tok/s, against 920 / 836 / 716 on
   two slots before; its concurrency sweep 154 tok/s with four requests in flight.
 
+### 15. Rollback by replay: one state a slot instead of a snapshot a token
+
+A verify step runs the draft's 8 tokens through the recurrent layers at once, and the rollback to the accepted count
+needed the state after each of them: the snapshots of section 13, 12 shared rows of 150 MiB plus the four live rows,
+2.4 GB. Now (the default; `LLAMA_RS_REPLAY=0` for the pool) every write keeps, in one row a slot, the state as it was
+8 tokens before its end (the GDN kernel's slot 1, written from its registers as it passes that token, the input state
+when the ubatch is shorter), and the GDN inputs of those last 8 tokens in two rings (the pre-conv projections and the
+raw alpha/beta product: one `set_rows` a tensor a layer, 13 MB a slot). A rollback of n tokens replays the first 8-n
+of them from the kept state into the live row before the slot's next step: a graph of the recurrent layers only, the
+conv, the gate and the delta rule as the forward ran them, so the state is the one the forward would have reached.
+The replay of a whole step reproduces the live state exactly (`LLAMA_RS_REPLAY_SELFTEST=1` checks it before every
+rollback; `=2` also checks a replay of several slots against each slot's own).
+
+- All slots with a pending rollback replay in one graph, of a length rounded up to a multiple of 4: the shorter
+  replays are padded with a pad token the delta rule leaves the state alone for (the x ring's zero row, the
+  alpha/beta ring's -inf row: gate 0, beta 0), and each slot's conv state is gathered from the three input columns
+  ending at its last real token. A whole rollback replays 0 tokens. One graph a (length, slots) shape, its rows all
+  inputs, so after its first run a replay is inputs and a CUDA graph launch (0.3 ms of host time); the kernel reads
+  each slot's kept row in place and writes its live row itself (the `set_rows` after it is fused into the launch, the
+  rows read from a device table), so a replay moves each state row once.
+- What a replay costs is the GDN kernel's serial pass over the replayed tokens (about 4 us a token a layer) and a
+  dozen small kernels a layer: 101.1 tok/s single stream against 106.1 with the pool's snapshots (BetterBench's
+  combined decode), and 158.1 / 153.9 tok/s aggregate with four / eight requests in flight against the pool's
+  145.6 / 144.3; the rows are 10 instead of 17, 1.0 GB back, which is what takes the pool from 245,760 tokens to the
+  model's 262,144.
+- The checkpoint 4 tokens before a prompt's end (section 10) replays into a scratch row instead of reading a snapshot.
+- The pool's plan, locks and re-packing are off under the replay; the spare cell of section 13 stays.
+
 ## Known limits
 
 - Tested only on V100 PCIe 32 GB with Qwen3.8-27B. The window and placement changes are on for the qwen35 model line
   only.
 - Combined decode tops out near 130–160 tok/s with four slots: a verify step costs about the same up to 8 rows, so the
   slots share 16 verify rows a step (section 12), and each slot drafts less when more generate.
-- Four slots at 245,760 tokens use ~32.4 GB of the card's 32.5: no room for a fifth slot or a larger pool. The
-  recurrent rows alone are 150 MiB each (section 13); the spare cell of section 13 is one of them.
+- Four slots at 262,144 tokens (the model's training context) use ~32.0 GB of the card's 32.5 under BetterBench. The
+  recurrent rows are 150 MiB each (sections 13 and 15), 10 of them with the replay.
 - The first two prompts after a start pay ~0.4 s once each to allocate a device checkpoint copy.
 - Two or more cards (`--split-mode tensor`) are supported by code reading only (the section after `## Run`): nothing
   here has run on more than one card.
