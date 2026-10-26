@@ -634,6 +634,19 @@ private:
     // does not queue behind the copy over the link. stage_ev_main: the device copies are done; stage_ev_copy: the host copies
     // are (the next stage waits on it on the device before it overwrites stage_buf)
     ggml_backend_t        stage_be      = nullptr;
+    // [TAG_RS_REPLAY_SIDE] the replay's own backend instance (its own stream) and the events that order it against the
+    // main backend: rs_side_ev_main (the main backend's graphs enqueued at the launch, waited for by the side backend),
+    // rs_side_ev (the replay, waited for by the main backend before its next graph and by the host before it reads rows)
+    ggml_backend_t        rs_side_be      = nullptr;
+    ggml_backend_event_t  rs_side_ev      = nullptr;
+    ggml_backend_event_t  rs_side_ev_main = nullptr;
+    bool                  rs_side_pending = false; // a replay recorded on rs_side_ev since the host last waited
+    bool                  rs_side_off     = false;
+    std::vector<ggml_backend_t>             rs_side_ptrs; // the scheduler's backends: the side one for the main device
+    std::vector<ggml_backend_buffer_type_t> rs_side_buft;
+    bool rs_side_init(); // once; false when the replay stays on the main backend
+    void rs_side_wait(); // the main backend waits for the replay (device side)
+    void rs_side_sync(); // the host waits for it
     ggml_backend_buffer_t stage_buf     = nullptr;
     ggml_backend_event_t  stage_ev_main = nullptr;
     ggml_backend_event_t  stage_ev_copy = nullptr;

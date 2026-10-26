@@ -554,6 +554,9 @@ bool llama_memory_recurrent::rs_view_back(llama_seq_id seq_id, int32_t n_back) {
             rs_view_pos[seq_id] = -1;
             return false;
         }
+        if (rs_side_sync_fn) {
+            rs_side_sync_fn(); // [TAG_RS_REPLAY_SIDE] the view is read on the host
+        }
         rs_view_row[seq_id] = (int32_t) rs_scratch_row;
         cell.pos -= n_back;
         return true;
@@ -616,6 +619,9 @@ uint32_t llama_memory_recurrent::rs_row(uint32_t idx, llama_seq_id seq, uint32_t
 bool llama_memory_recurrent::rs_copy_rows(uint32_t row_src, uint32_t row_dst) {
     if (row_src == row_dst) {
         return true;
+    }
+    if (rs_side_sync_fn) {
+        rs_side_sync_fn(); // [TAG_RS_REPLAY_SIDE]
     }
     const size_t n_views = 2*3*r_l.size()*rs_n_dev(r_l, s_l);
     if (!bak_view_ctx || ggml_get_mem_size(bak_view_ctx.get()) < n_views*ggml_tensor_overhead()) {
@@ -744,6 +750,9 @@ bool llama_memory_recurrent::rs_copy_row_to_live(llama_seq_id seq_id, uint32_t r
     const int32_t tail = seq_cell(seq_id);
     if (tail < 0 || !cells[tail].has_seq_id(seq_id)) {
         return false;
+    }
+    if (rs_side_sync_fn) {
+        rs_side_sync_fn(); // [TAG_RS_REPLAY_SIDE]
     }
     {
         const size_t n_views = 2*3*r_l.size()*rs_n_dev(r_l, s_l);

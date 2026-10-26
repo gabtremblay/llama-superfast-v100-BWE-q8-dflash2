@@ -428,9 +428,10 @@ llama_context::llama_context(
                 r->rs_replay_fn   = [this](llama_seq_id s, uint32_t k, uint32_t row) { return rs_replay(s, k, row); };
                 // the eager replay (LLAMA_RS_REPLAY_EAGER=1): one graph a rollback, from seq_rm; the default replays every
                 // pending rollback in one graph before the next decode
-                if (getenv("LLAMA_RS_REPLAY_EAGER") != nullptr && atoi(getenv("LLAMA_RS_REPLAY_EAGER")) != 0) {
-                    r->rs_rollback_fn = [this](llama_seq_id s) { rs_replay_one(s); };
-                }
+                // [TAG_RS_REPLAY_SIDE] on the side backend the replay is eager by default: launched from seq_rm, it runs under
+                // the draft's work (rs_replay_one decides, once the backends exist). LLAMA_RS_REPLAY_EAGER=0/1 overrides
+                r->rs_rollback_fn  = [this](llama_seq_id s) { rs_replay_one(s); };
+                r->rs_side_sync_fn = [this]() { rs_side_sync(); };
             }
         }
     }
@@ -587,7 +588,16 @@ llama_context::~llama_context() {
     if (stage_ev_copy) { ggml_backend_event_free(stage_ev_copy); stage_ev_copy = nullptr; }
     if (stage_buf)     { ggml_backend_buffer_free(stage_buf);    stage_buf     = nullptr; }
     if (stage_be)      { ggml_backend_free(stage_be);            stage_be      = nullptr; }
+    if (rs_side_ev)      { ggml_backend_event_free(rs_side_ev);      rs_side_ev      = nullptr; }
+    if (rs_side_ev_main) { ggml_backend_event_free(rs_side_ev_main); rs_side_ev_main = nullptr; }
 
+    if (rs_side_be) {
+        for (auto & sc : sched_rs_k) {
+            sc.reset();
+        }
+        ggml_backend_free(rs_side_be);
+        rs_side_be = nullptr;
+    }
     for (auto & ev : pipe_ev) {
         if (ev) {
             ggml_backend_event_free(ev);
@@ -2851,6 +2861,88 @@ uint32_t llama_context::kv_room(llama_seq_id seq_id) const {
 // (length, sequence count) graph is built once and its CUDA graph reused from then on, and a whole rollback (0 tokens)
 // replays in the graph too. A slot moves its state row several times, so a sequence without a rollback takes none.
 // LLAMA_RS_REPLAY_SHAPES=1: one graph a (length, sequences) shape, whole rollbacks copied
+// [TAG_RS_REPLAY_SIDE] the replay's own backend instance on the recurrent cache's device (one device only), with the
+// main backends' buffer types, so its scheduler reads the model's weights and the cache as the main one does
+bool llama_context::rs_side_init() {
+    if (rs_side_be != nullptr) {
+        return true;
+    }
+    if (rs_side_off) {
+        return false;
+    }
+    rs_side_off = true;
+    const char * e = getenv("LLAMA_RS_REPLAY_SIDE");
+    if (e != nullptr && atoi(e) == 0) {
+        return false;
+    }
+    auto * h = dynamic_cast<llama_memory_hybrid *>(memory.get());
+    llama_memory_recurrent * recr = h ? h->get_mem_recr() : nullptr;
+    if (recr == nullptr || recr->rs_replay == 0 || backend_ptrs.empty()) {
+        return false;
+    }
+    ggml_backend_dev_t dev = nullptr;
+    for (ggml_tensor * t : recr->s_l) {
+        if (t == nullptr) {
+            continue;
+        }
+        ggml_backend_dev_t d = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(t->buffer));
+        if (d == nullptr || (dev != nullptr && d != dev) || ggml_backend_dev_type(d) != GGML_BACKEND_DEVICE_TYPE_GPU) {
+            return false;
+        }
+        dev = d;
+    }
+    if (dev == nullptr) {
+        return false;
+    }
+    ggml_backend_t main_be = nullptr;
+    for (ggml_backend_t be : backend_ptrs) {
+        if (ggml_backend_get_device(be) == dev) {
+            main_be = be;
+        }
+    }
+    if (main_be == nullptr) {
+        return false;
+    }
+    ggml_backend_t side = ggml_backend_dev_init(dev, nullptr);
+    if (side == nullptr) {
+        return false;
+    }
+    rs_side_ev      = ggml_backend_event_new(dev);
+    rs_side_ev_main = ggml_backend_event_new(dev);
+    if (rs_side_ev == nullptr || rs_side_ev_main == nullptr) {
+        ggml_backend_free(side);
+        return false;
+    }
+    rs_side_ptrs = backend_ptrs;
+    rs_side_buft = backend_buft;
+    for (auto & be : rs_side_ptrs) {
+        if (be == main_be) {
+            be = side;
+        }
+    }
+    rs_side_be = side;
+    LLAMA_LOG_INFO("%s: the rollback replay runs on its own %s stream, under the draft (LLAMA_RS_REPLAY_SIDE=0: on the main one)\n", __func__, ggml_backend_dev_name(dev));
+    return true;
+}
+
+void llama_context::rs_side_wait() {
+    if (rs_side_be == nullptr || !rs_side_pending) {
+        return;
+    }
+    for (ggml_backend_t be : backend_ptrs) {
+        if (ggml_backend_get_device(be) == ggml_backend_get_device(rs_side_be)) {
+            ggml_backend_event_wait(be, rs_side_ev);
+        }
+    }
+}
+
+void llama_context::rs_side_sync() {
+    if (rs_side_be != nullptr && rs_side_pending) {
+        ggml_backend_event_synchronize(rs_side_ev);
+        rs_side_pending = false;
+    }
+}
+
 static bool rs_replay_one_shape() {
     static const bool one = [] {
         const char * e = getenv("LLAMA_RS_REPLAY_SHAPES");
@@ -2870,10 +2962,14 @@ void llama_context::rs_replay_one(llama_seq_id s) {
     if (k < 0) {
         return;
     }
+    static const int eager_env = getenv("LLAMA_RS_REPLAY_EAGER") != nullptr ? atoi(getenv("LLAMA_RS_REPLAY_EAGER")) : -1;
+    if (!(eager_env >= 0 ? eager_env != 0 : rs_side_init())) {
+        return; // the batched replay before the next decode takes it
+    }
     static const bool rlog = getenv("LLAMA_RS_POOL_LOG") != nullptr;
     const int64_t t0 = ggml_time_us();
     bool ok;
-    if (k == 0) {
+    if (k == 0 && !rs_replay_one_shape()) {
         synchronize();
         ok = recr->rs_copy_kept(s);
     } else {
@@ -2897,7 +2993,11 @@ void llama_context::rs_replay_one(llama_seq_id s) {
 void llama_context::rs_replay_pending(const llama_batch & b) {
     auto * h = dynamic_cast<llama_memory_hybrid *>(memory.get());
     llama_memory_recurrent * recr = h ? h->get_mem_recr() : nullptr;
-    if (recr == nullptr || recr->rs_replay == 0 || b.n_tokens <= 0) {
+    if (recr == nullptr || recr->rs_replay == 0) {
+        return;
+    }
+    rs_side_wait(); // [TAG_RS_REPLAY_SIDE] the graphs that follow read what a side replay wrote
+    if (b.n_tokens <= 0) {
         return;
     }
     static const bool rlog = getenv("LLAMA_RS_POOL_LOG") != nullptr;
@@ -2926,6 +3026,7 @@ void llama_context::rs_replay_pending(const llama_batch & b) {
                 const uint32_t m    = cell >= 0 ? std::min<uint32_t>(recr->cells[cell].n_last, recr->rs_replay) : 0;
                 if (m >= 1 && rs_replay(s, m, recr->rs_scratch_row)) {
                     synchronize();
+                    rs_side_sync();
                     int n_bad = 0, first_bad = -1;
                     float max_diff = 0.0f;
                     for (size_t il = 0; il < recr->s_l.size(); ++il) {
@@ -3028,6 +3129,7 @@ void llama_context::rs_replay_pending(const llama_batch & b) {
                     continue;
                 }
                 synchronize();
+                rs_side_sync();
                 int n_bad = 0;
                 float max_diff = 0.0f;
                 for (size_t il = 0; il < recr->s_l.size(); ++il) {
@@ -3164,7 +3266,9 @@ bool llama_context::rs_replay_batch(const std::vector<llama_seq_id> & seqs, cons
     bool first = false;
     if (!sched_rs_k[k]) {
         const size_t max_nodes = this->graph_max_nodes(std::min(cparams.n_ctx, cparams.n_ubatch));
-        sched_rs_k[k].reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, false, cparams.op_offload));
+        const bool side = rs_side_init(); // [TAG_RS_REPLAY_SIDE]
+        sched_rs_k[k].reset(ggml_backend_sched_new(side ? rs_side_ptrs.data() : backend_ptrs.data(), side ? rs_side_buft.data() : backend_buft.data(),
+                                                  backend_ptrs.size(), max_nodes, false, cparams.op_offload));
         sched_own_events(sched_rs_k[k].get());
         gf_res_rs_k[k].reset(new llm_graph_result(gf_res_reserve->get_max_nodes()));
         first = true;
@@ -3176,12 +3280,25 @@ bool llama_context::rs_replay_batch(const std::vector<llama_seq_id> & seqs, cons
     n_outputs = 0;
 
     ggml_status st = GGML_STATUS_SUCCESS;
+    if (rs_side_be != nullptr) {
+        // [TAG_RS_REPLAY_SIDE] after the main backend's enqueued graphs (a pipelined decode may still read the rows)
+        for (ggml_backend_t be : backend_ptrs) {
+            if (ggml_backend_get_device(be) == ggml_backend_get_device(rs_side_be)) {
+                ggml_backend_event_record(rs_side_ev_main, be);
+                ggml_backend_event_wait(rs_side_be, rs_side_ev_main);
+            }
+        }
+    }
     rs_replay_active = true;
     const int32_t n_reused0 = n_reused;
     const int64_t t_b = ggml_time_us();
     ggml_rt_label(this, 100 + (int) k); // the round timers: replay graphs apart from the decode's (c0/10k)
     llm_graph_result * res = process_ubatch(ub, LLM_GRAPH_TYPE_RS_REPLAY, &rctx, st);
     rs_replay_active = false;
+    if (rs_side_be != nullptr) {
+        ggml_backend_event_record(rs_side_ev, rs_side_be); // [TAG_RS_REPLAY_SIDE]
+        rs_side_pending = true;
+    }
     rs_replay_last_reused = n_reused > n_reused0;
     const int64_t t_c = ggml_time_us();
 
@@ -3190,7 +3307,7 @@ bool llama_context::rs_replay_batch(const std::vector<llama_seq_id> & seqs, cons
     if (first) {
         std::string bufs;
         for (size_t i = 0; i < backend_ptrs.size(); ++i) {
-            const size_t sz = ggml_backend_sched_get_buffer_size(sched.get(), backend_ptrs[i]);
+            const size_t sz = ggml_backend_sched_get_buffer_size(sched.get(), rs_side_be != nullptr ? rs_side_ptrs[i] : backend_ptrs[i]); // the scheduler's own backends
             if (sz > 0) {
                 bufs += format(" %s %.2f MiB", ggml_backend_buft_name(backend_buft[i]), sz/1024.0/1024.0);
             }

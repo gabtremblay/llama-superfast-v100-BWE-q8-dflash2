@@ -97,6 +97,8 @@ public:
     // the eager replay: set by the context, called as soon as seq_rm records a rollback, so the replay runs on the device while
     // the caller goes on with its host work (the draft, the sampling) instead of right before the next decode
     std::function<void(llama_seq_id)> rs_rollback_fn;
+    // [TAG_RS_REPLAY_SIDE] the host waits for a replay in flight on the side stream before it copies or reads rows
+    std::function<void()> rs_side_sync_fn;
     uint32_t rs_bak_row(llama_seq_id seq_id) const { return size + (uint32_t) seq_id; }
     uint32_t rs_ring_zero_row() const { return rs_replay * n_seq_max; } // the ring's last row, all zero: a pad token
     int32_t  seq_cell(llama_seq_id seq_id) const { return seq_id >= 0 && (uint32_t) seq_id < size ? cells[seq_id].tail : -1; }
