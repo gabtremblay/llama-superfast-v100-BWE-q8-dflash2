@@ -298,7 +298,7 @@ public:
     std::vector<uint32_t> snap_row1;
 
     // [TAG_RS_REPLAY] rs_replay: the tokens of GDN inputs a sequence's ring keeps (0: off); ring_m the ubatch's tokens that go to
-    // it (min(n_seq_tokens, rs_replay)), ring_idx their rows (seq*rs_replay + j), I32 [ring_m, n_seqs]; replay_graph: this graph
+    // it (min(n_seq_tokens, rs_replay)), ring_idx their rows (seq*rs_replay + j), I32 [ring_m * n_seqs]; replay_graph: this graph
     // replays a ring into the live row (one state read from the kept row, no snapshots, no ring writes)
     uint32_t      rs_replay    = 0;
     uint32_t      ring_m       = 0;

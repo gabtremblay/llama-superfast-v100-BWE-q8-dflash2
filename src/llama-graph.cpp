@@ -350,7 +350,7 @@ void llm_graph_input_rs::set_input(const llama_ubatch * ubatch) {
     // [TAG_RS_REPLAY] the ring rows of each sequence's last ring_m tokens
     if (ring_idx) {
         GGML_ASSERT(ggml_backend_buffer_is_host(ring_idx->buffer));
-        GGML_ASSERT(ring_idx->ne[0] == (int64_t) ring_m && ring_idx->ne[1] == (int64_t) ubatch->n_seqs);
+        GGML_ASSERT(ring_idx->ne[0] == (int64_t) ring_m * ubatch->n_seqs);
         int32_t * data = (int32_t *) ring_idx->data;
         for (uint32_t s = 0; s < ubatch->n_seqs; ++s) {
             const llama_seq_id seq = ubatch->seq_id[s*ubatch->n_seq_tokens][0];
@@ -401,7 +401,7 @@ bool llm_graph_input_rs::can_reuse(const llm_graph_params & params) {
     res &= replay_graph == mctx->is_replay();
     res &= (ring_idx != nullptr) == (mctx->get_rs_replay() > 0 && !mctx->is_replay());
     if (ring_idx != nullptr) {
-        res &= ring_idx->ne[0] == (int64_t) std::min<uint32_t>(params.ubatch.n_seq_tokens, rs_replay) && ring_idx->ne[1] == (int64_t) params.ubatch.n_seqs;
+        res &= ring_idx->ne[0] == (int64_t) std::min<uint32_t>(params.ubatch.n_seq_tokens, rs_replay) * params.ubatch.n_seqs;
     }
     res &= rs_z == mctx->get_rs_z();
 
@@ -4077,7 +4077,7 @@ static std::unique_ptr<llm_graph_input_rs> build_rs_inp_impl(
     inp->replay_graph = mctx_cur->is_replay();
     if (inp->rs_replay > 0 && !inp->replay_graph) {
         inp->ring_m   = std::min<uint32_t>(ubatch.n_seq_tokens, inp->rs_replay);
-        inp->ring_idx = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, inp->ring_m, n_seqs);
+        inp->ring_idx = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, (int64_t) inp->ring_m * n_seqs);
         ggml_set_input(inp->ring_idx);
     }
 

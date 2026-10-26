@@ -541,11 +541,15 @@ void llm_build_delta_net_base::build_rs_ring_write(llm_graph_input_rs * inp, ggm
     const int64_t T = src->ne[1];
     const int64_t B = src->ne[2];
     GGML_ASSERT(src->ne[0] == ring->ne[0] && m >= 1 && m <= T && src->type == GGML_TYPE_F32);
-    ggml_tensor * tail = ggml_view_3d(ctx0, src, src->ne[0], m, B, src->nb[1], src->nb[2], (size_t) (T - m) * src->nb[1]);
-    // the ring as one slice a sequence that all alias the whole ring (stride 0), so set_rows takes the 3D source and the
-    // per-sequence row table
-    ggml_tensor * ring3 = ggml_view_3d(ctx0, ring, ring->ne[0], ring->ne[1], B, ring->nb[1], 0, 0);
-    ggml_tensor * w     = ggml_set_rows(ctx0, ring3, tail, inp->ring_idx);
+    // the rows: a decode's ubatch is its own tail (a reshape); a prompt chunk's last m tokens a sequence are gathered first
+    ggml_tensor * tail;
+    if (m == T) {
+        tail = ggml_reshape_2d(ctx0, src, src->ne[0], m*B);
+    } else {
+        tail = ggml_cont(ctx0, ggml_view_3d(ctx0, src, src->ne[0], m, B, src->nb[1], src->nb[2], (size_t) (T - m) * src->nb[1]));
+        tail = ggml_reshape_2d(ctx0, tail, src->ne[0], m*B);
+    }
+    ggml_tensor * w = ggml_set_rows(ctx0, ring, tail, inp->ring_idx);
     ggml_format_name(w, "rs_ring_write-%d", il);
     ggml_build_forward_expand(gf, w);
 }
