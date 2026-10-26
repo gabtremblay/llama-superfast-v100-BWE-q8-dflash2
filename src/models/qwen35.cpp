@@ -396,7 +396,7 @@ bool llama_model_qwen35::graph::tbo_applies() const {
     }();
     static const bool replay_on = [] {
         const char * e = getenv("LLAMA_RS_REPLAY");
-        return e != nullptr && atoi(e) != 0;
+        return e == nullptr || atoi(e) != 0; // the replay is the default
     }();
     if (replay_on) {
         return false; // [TAG_RS_REPLAY] the halves' GDN inputs are not kept in the rings

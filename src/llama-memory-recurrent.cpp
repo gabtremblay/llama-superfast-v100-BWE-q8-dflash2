@@ -93,9 +93,10 @@ llama_memory_recurrent::llama_memory_recurrent(
 
     // [TAG_RS_REPLAY]
     {
+        // the default since the replay (section 15): LLAMA_RS_REPLAY=0 restores the snapshot pool
         const char * e = getenv("LLAMA_RS_REPLAY");
-        if (e != nullptr && atoi(e) != 0 && n_rs_seq > 0) {
-            rs_replay = std::max<uint32_t>((uint32_t) std::max(0, atoi(e)), n_rs_seq + 1);
+        if ((e == nullptr || atoi(e) != 0) && n_rs_seq > 0) {
+            rs_replay = std::max<uint32_t>(e ? (uint32_t) std::max(0, atoi(e)) : 0u, n_rs_seq + 1);
             if (n_rs_bak > 0) {
                 LLAMA_LOG_WARN("%s: LLAMA_RS_REPLAY does not combine with pipelined speculation (LLAMA_SPEC_PIPELINE): replay is off\n", __func__);
                 rs_replay = 0;
