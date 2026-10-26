@@ -1,4 +1,4 @@
-# llama-superfast-v100-q8-inscora
+# llama-superfast-v100-q8-dflash2
 
 A fork of [bitexploder/llama-superfast-v100](https://github.com/bitexploder/llama-superfast-v100), the llama.cpp fork
 tuned for the Tesla V100 (Volta, `sm_70`), created for **one V100 card**, a **single user**, **up to four concurrent
