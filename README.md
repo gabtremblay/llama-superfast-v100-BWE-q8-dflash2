@@ -399,8 +399,9 @@ a depth of 3 made a lone slot draft 3 as well (decode 74–82 tok/s instead of 9
 - A fifth live cell (`LLAMA_RS_SPARE=0` drops it, 150 MiB) keeps a prompt job's state where it is: llama.cpp gathers
   the cells of the sequences decoding together into one run by swapping cells, and with a cell a slot, three slots
   decoding while the fourth held a prompt job swapped the job's cell into their run, and the next decode copied another
-  slot's state over it (the job's row check aborted the server about one run of the 8-in-flight probe in three). The
-  gather now takes a run beside a job's cell.
+  slot's state over it (the job's row check aborted the server about one run of the 8-in-flight probe in three). A prompt
+  job's sequence now moves to the fifth cell, at the top, when the job begins (one copy of its state row), so the runs of
+  the other sequences, all below it, never straddle it.
 - The graph writes each sequence's snapshots as a copy of its own (the fused GDN cache write takes per-sequence bases),
   and the snapshot rows belong to the sequence, not to the storage cell: `f8aaffa` fixed a lookup through the cell,
   which read another sequence's snapshot once the cache had moved a sequence's state (three pinned slots generating
