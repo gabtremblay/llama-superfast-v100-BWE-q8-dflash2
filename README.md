@@ -345,7 +345,9 @@ request's prompt waited until the other slot finished generating, or (`LLAMA_TU_
   as jobs of at most 1,024 rows (`LLAMA_TU_GEN_JOB_ROWS`), and a shorter job's groups take more layers. A group's time
   grows with the depth of the prompt read so far (1,024 rows over 4 layers: 82 ms at 8k tokens, 138 ms at 125k), so
   the generating slot gets one round per 80 ms of a group's measured time (`LLAMA_TU_GEN_ROUND_MS`, at most
-  `LLAMA_TU_GEN_ROUNDS_MAX` 4): one at 8k as before, two at 125k, where it keeps ~40% of the card instead of 28%.
+  `LLAMA_TU_GEN_ROUNDS_MAX` 4): one at 8k as before, two from ~60k. Beside a 123k-token read, at 60-90k of depth the
+  generating slot 5.5 -> 8.1 rounds/s (30 -> 46 tok/s) and the read 375 -> 318 tok/s, at 90-120k 4.8 -> 7.6 (26 -> 43)
+  and 327 -> 287; the whole read 308 -> 322 s. A 29k-token read is unchanged (529 tok/s, the generating slot 38).
   Shrinking the job's rows instead (`LLAMA_TU_GEN_GROUP_MS`, a target group time, default off) costs the read more:
   a group's cost has a part per group (the context's KV), and at 60-90k of depth a 55 ms target took the read from
   375 to 182 tok/s for the generating slot's 5.5 -> 9.3 rounds/s, an 80 ms target to 241 tok/s for 7.6. Idle, a job's
