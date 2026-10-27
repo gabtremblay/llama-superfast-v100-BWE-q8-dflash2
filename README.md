@@ -2,7 +2,7 @@
 
 A fork of [bitexploder/llama-superfast-v100](https://github.com/bitexploder/llama-superfast-v100), the llama.cpp fork
 tuned for the Tesla V100 (Volta, `sm_70`), made for **one V100 card**, a **single user**, **up to four concurrent slots**
-on a **unified KV cache**, and the **DFlash2 speculative draft**, with some ideas stolen from ReVolta: agentic work
+on a **unified KV cache**, and the **DFlash2 speculative draft**, with some ideas stolen from [ReVolta](https://github.com/Leonccaa/ReVolta): agentic work
 made palatable at the model's whole 262,144-token context on one 32 GB card.
 
 The model is Qwen3.8-27B (`UD-Q4_K_XL`) on a V100 PCIe 32 GB, decoded with [DFlash2](https://github.com/z-lab/dflash),
@@ -255,7 +255,7 @@ What was measured (four slots, `LLAMA_RS_POOL=12`, `--cache-ram 0`):
 MIT, like [llama.cpp](https://github.com/ggml-org/llama.cpp) and [ggml](https://github.com/ggml-org/ggml). Built on
 [bitexploder/llama-superfast-v100](https://github.com/bitexploder/llama-superfast-v100); its credits for the models,
 the draft vocabulary and ported kernels are in [`README-27B.md`](README-27B.md). DFlash2 is
-[z-lab/dflash](https://github.com/z-lab/dflash). Some ideas were stolen from ReVolta. Part of this work was sponsored by
+[z-lab/dflash](https://github.com/z-lab/dflash). Some ideas were stolen from [ReVolta](https://github.com/Leonccaa/ReVolta). Part of this work was sponsored by
 [Inscora](https://inscora.com).
 
 ---
