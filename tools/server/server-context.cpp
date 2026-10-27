@@ -4923,6 +4923,10 @@ private:
     // slot not yet started counts its prompt less the prefix its start will reuse (the start's own expression), computed once
     // per task so no prompt is scanned every iteration; the start's later adjustments are corrected when it is re-ranked
     int32_t tu_remaining(server_slot & slot) const {
+        // a slot released during this round (TAG_KV_ADMIT refuses a prompt in the middle of the round's prompt pass) has no task
+        if (slot.task == nullptr) {
+            return 0;
+        }
         if (slot.state == SLOT_STATE_STARTED && slot.tu_prefix_id_task != slot.task->id) {
             slot.tu_prefix_id_task = slot.task->id;
             slot.tu_prefix = slot.task->params.cache_prompt ? (int32_t) slot.prompt.tokens.get_common_prefix(slot.task->tokens) : 0;
@@ -6160,6 +6164,10 @@ private:
                                                          slot.task->n_tokens(), n_add, n_free, need),
                                            ERROR_TYPE_EXCEED_CONTEXT_SIZE);
                                 slot.release();
+                                // the round's reader choice was made before this pass: it must not keep a released slot
+                                if (tu_pick == &slot) {
+                                    tu_pick = nullptr;
+                                }
                                 return;
                             }
                         }
