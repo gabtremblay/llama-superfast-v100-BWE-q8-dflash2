@@ -346,7 +346,9 @@ request's prompt waited until the other slot finished generating, or (`LLAMA_TU_
   grows with the depth of the prompt read so far (1,024 rows over 4 layers: 82 ms at 8k tokens, 138 ms at 125k), and
   the generating slot gets one round per group, so each job measures its groups and the read's next job takes the
   rows that keep a group near 55 ms (`LLAMA_TU_GEN_GROUP_MS`; 0 keeps the cap; at least `LLAMA_TU_GEN_JOB_ROWS_MIN`,
-  256). Idle, a job's
+  256): beside a 123k-token read the generating slot 32 -> 46 tok/s and the read 401 -> 316 tok/s; beside a 29k-token
+  read 39 -> 48 and 530 -> 391 (the card's work shared about evenly instead of one third to the generating slot;
+  the smaller jobs cost ~4% of the total). Idle, a job's
   slices and groups are longer (`LLAMA_TU_IDLE_SLICE_MS`, `LLAMA_TU_IDLE_GROUP`), so a lone long prompt reads within
   ~1% of the scheduler being off.
 - A 24k-token side prompt beside a generating slot: it starts at once, and the generating slot keeps ~34 tok/s with
