@@ -2233,8 +2233,11 @@ private:
                     continue;
                 }
 
-                // select the current slot if the criteria match
-                if (!ret || (tu_policy.fix ? (slot.t_last_used < t_last) : (slot.t_last_used <= t_last))) {
+                // select the current slot if the criteria match. [TAG_CACHE_RETURN] an empty slot comes first: a conversation
+                // that comes back from the prompt cache then takes it instead of displacing a live one
+                const bool empty_wins = ret != nullptr && slot.prompt.tokens.empty() && !ret->prompt.tokens.empty();
+                const bool empty_loses = ret != nullptr && !slot.prompt.tokens.empty() && ret->prompt.tokens.empty();
+                if (!ret || empty_wins || (!empty_loses && (tu_policy.fix ? (slot.t_last_used < t_last) : (slot.t_last_used <= t_last)))) {
                     t_last = slot.t_last_used;
                     ret = &slot;
                 }
@@ -2268,7 +2271,13 @@ private:
                         break;
                     }
                 }
-                if (!params_base.cache_idle_slots || !task.params.cache_prompt || peer_busy) {
+                // [TAG_CACHE_RETURN] with --cache-idle-slots off, the cache holds the conversations that left the slots (cleared
+                // by kv_evict_idle, or replaced here: the slot's own is saved before the load) and gives them back when they
+                // return, whether or not a peer is busy: the save and the load pause the server for ~0.5 s per 40k tokens over
+                // the eGPU link, against a re-read of minutes. With it on, upstream's rule: no cache use while a peer is busy.
+                // LLAMA_CACHE_RETURN=0 restores upstream's rule for both
+                static const bool cache_return = [] { const char * e = getenv("LLAMA_CACHE_RETURN"); return e ? atoi(e) != 0 : true; }();
+                if (!task.params.cache_prompt || (params_base.cache_idle_slots ? peer_busy : !cache_return)) {
                     update_cache = false;
                 }
             }
@@ -2277,8 +2286,9 @@ private:
                 SRV_TRC("%s", "updating prompt cache\n");
 
                 const int64_t t_start = ggml_time_us();
+                const size_t  n_before = ret->prompt.tokens.size();
 
-                ret->prompt_save(*prompt_cache, &task.tokens);
+                const bool saved = ret->prompt_save(*prompt_cache, &task.tokens);
 
                 if (!ret->prompt_load(*prompt_cache, task.tokens)) {
                     ret->prompt_clear();
@@ -2286,7 +2296,11 @@ private:
 
                 prompt_cache->update();
 
-                SRV_TRC("prompt cache update took %.2f ms\n", (ggml_time_us() - t_start) / 1000.0);
+                const size_t n_after = ret->prompt.tokens.size();
+                const size_t lcp     = ret->prompt.tokens.get_common_prefix(task.tokens);
+                LOG_WRN("[scheduler] prompt_cache: t_us=%" PRId64 " slot=%d saved=%zu tokens, loaded=%d (%zu tokens, %zu of them this prompt's), entries=%zu (%.1f MiB), %.1f ms\n",
+                        ggml_time_us(), ret->id, saved ? n_before : (size_t) 0, n_after != n_before || lcp > 0 ? 1 : 0, n_after, lcp,
+                        prompt_cache->states.size(), prompt_cache->size() / 1048576.0, (ggml_time_us() - t_start) / 1000.0);
             }
         }
 
