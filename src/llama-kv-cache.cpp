@@ -1710,18 +1710,34 @@ uint32_t llama_kv_cache::seqs_pack(const std::vector<llama_seq_id> & seqs, const
     // stream is synchronized once at the end (ggml_backend_tensor_copy synchronizes after each copy: 23.7k cells moved by
     // 2,048 took 1.5 s that way, 24 ms moved in one piece)
     sync();
+    // with a backend, a range goes through the device scratch in two copies of up to the scratch's size, whatever its
+    // distance (chunked by the distance, a 23.7k-cell move by a few cells was thousands of tiny copies: 0.5 s); without
+    // one (a split cache), the chunks are no longer than the distance and each copy is synchronous
+    const size_t scratch_bytes = 64ull << 20;
     auto move_rows = [&](ggml_tensor * t, ggml_backend_t be) {
+        if (be != nullptr && !pack_scratch) {
+            pack_scratch.reset(ggml_backend_buft_alloc_buffer(ggml_backend_buffer_get_type(t->buffer), scratch_bytes));
+        }
+        const bool via_scratch = be != nullptr && pack_scratch && t->nb[1] > 0 && (size_t) t->nb[1] <= scratch_bytes;
         for (const move_t & m : moves) {
             const uint32_t gap = m.src - m.dst;
+            const uint32_t cap = via_scratch ? (uint32_t) std::min<size_t>(UINT32_MAX, scratch_bytes / t->nb[1]) : gap;
             for (uint32_t off = 0; off < m.n; ) {
-                const uint32_t n = std::min(gap, m.n - off);
+                const uint32_t n = std::min(cap, m.n - off);
                 ggml_tensor s = *t;
                 s.ne[1]    = (int64_t) n;
                 s.data     = (char *) t->data + (size_t) (m.src + off)*t->nb[1];
                 s.view_src = t->view_src ? t->view_src : t;
                 ggml_tensor d = s;
                 d.data     = (char *) t->data + (size_t) (m.dst + off)*t->nb[1];
-                if (be != nullptr) {
+                if (via_scratch) {
+                    ggml_tensor x = s;
+                    x.buffer   = pack_scratch.get();
+                    x.data     = ggml_backend_buffer_get_base(pack_scratch.get());
+                    x.view_src = nullptr;
+                    ggml_backend_tensor_copy_async(be, be, &s, &x);
+                    ggml_backend_tensor_copy_async(be, be, &x, &d);
+                } else if (be != nullptr) {
                     ggml_backend_tensor_copy_async(be, be, &s, &d);
                 } else {
                     ggml_backend_tensor_copy(&s, &d);

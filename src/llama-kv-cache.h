@@ -191,6 +191,8 @@ public:
     // cells and cells shared by several sequences stay. A device copy of the rows, a few ms per 10k cells. Returns the cells moved
     // backend: the device's, for asynchronous row copies synchronized once at the end (nullptr: a synchronous copy each)
     uint32_t seqs_pack(const std::vector<llama_seq_id> & seqs, const std::function<void()> & sync, ggml_backend_t backend = nullptr);
+    // the device scratch the pack moves a range through (allocated on first use from the cache's buffer type, 64 MiB)
+    ggml_backend_buffer_ptr pack_scratch;
 
     // the start of the free run for need cells: the lowest run of need + margin cells, else the largest of at least need; -1 when none
     int64_t free_run_for(const llama_kv_cells & cells, uint32_t need) const;
