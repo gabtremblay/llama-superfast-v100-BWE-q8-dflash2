@@ -1308,7 +1308,17 @@ private:
         double longest_slice_ms = 0.0;
         double last_group_ms    = -1.0; // the last measured group of the current ubatch, -1 at a ubatch's start
         int32_t steps           = 0;    // the job's llama_decode_job_step calls
+        double group_ms         = 0.0;  // [TAG_TU_GEN_GROUP_MS] the job's measured groups: their time, and their rows x layers
+        double group_rowlayers  = 0.0;
     } tu_job;
+
+    // [TAG_TU_GEN_GROUP_MS] a group's time per row and layer as the last job measured it, with the read it belongs to: the
+    // read's next job beside a generating slot takes the rows that keep a group near LLAMA_TU_GEN_GROUP_MS
+    struct {
+        int    id_slot = -1;
+        int    id_task = -1;
+        double ms_rl   = 0.0;
+    } tu_adapt;
 
     llama_model   * model_dft = nullptr;
     llama_context * ctx_dft   = nullptr;
@@ -4644,6 +4654,23 @@ private:
         return v;
     }
 
+    // [TAG_TU_GEN_GROUP_MS] the rows of this slot's next job beside a generating slot: at most tu_gen_job_rows(), fewer once the
+    // read's groups measure longer than LLAMA_TU_GEN_GROUP_MS (default 55 ms; 0: the cap alone). A group of 1,024 rows and 4
+    // layers takes 82 ms at 8k tokens of depth and 138 ms at 125k (attention over the prompt read so far), and the generating
+    // slot, one round per group, fell from 40% of the card to 28%: 25 tok/s beside a 125k-token read. The first job of a read
+    // takes the cap (nothing measured yet). Rows are a multiple of 64, at least LLAMA_TU_GEN_JOB_ROWS_MIN (default 256)
+    int32_t tu_gen_job_rows_for(const server_slot & slot) const {
+        static const double  target_ms = [] { const char * e = getenv("LLAMA_TU_GEN_GROUP_MS"); return e ? atof(e) : 55.0; }();
+        static const int32_t rows_min  = [] { const char * e = getenv("LLAMA_TU_GEN_JOB_ROWS_MIN"); return e ? std::max(64, atoi(e)) : 256; }();
+        const int32_t cap = tu_gen_job_rows();
+        if (target_ms <= 0.0 || tu_adapt.ms_rl <= 0.0 || tu_adapt.id_slot != slot.id || slot.task == nullptr || tu_adapt.id_task != slot.task->id) {
+            return cap;
+        }
+        const double  rows = target_ms / (tu_adapt.ms_rl * std::max(1, tu_policy.group));
+        const int32_t r    = (int32_t) std::min<double>(cap, std::max<double>(rows_min, rows)) / 64 * 64;
+        return std::max(rows_min, std::min(cap, r));
+    }
+
     // the job begins over batch_tu, after this iteration's decode round, and runs its first slice
     void tu_start() {
         server_slot * slot = batch_tu.slot_batched;
@@ -4661,7 +4688,7 @@ private:
         {
             const int32_t n_rows = std::max<int32_t>(1, batch_tu.size());
             // the rows of a full job: a ubatch, or with a slot generating the job's cap (TAG_TU_GEN_JOB_ROWS)
-            const int32_t n_ub   = tu_peer() ? std::min<int32_t>((int32_t) llama_n_ubatch(ctx_tgt), tu_gen_job_rows()) : (int32_t) llama_n_ubatch(ctx_tgt);
+            const int32_t n_ub   = tu_peer() ? std::min<int32_t>((int32_t) llama_n_ubatch(ctx_tgt), tu_gen_job_rows_for(*slot)) : (int32_t) llama_n_ubatch(ctx_tgt);
             const int32_t n_lay  = llama_model_n_layer(model_tgt);
             const int32_t layers = group_rows ? (int32_t) std::min<int64_t>(n_lay, (int64_t) tu_policy.group*std::max<int32_t>(1, n_ub/n_rows))
                                               : tu_policy.group;
@@ -4995,6 +5022,10 @@ private:
             tu_job.service_ms += dt;
 
             tu_job.last_group_ms = ret == LLAMA_DECODE_JOB_YIELDED && ran > 0 ? dt/ran : -1.0;
+            if (ran > 0) {
+                tu_job.group_ms        += dt;
+                tu_job.group_rowlayers += (double) ran * std::min<int32_t>(batch_tu.size(), llama_n_ubatch(ctx_tgt)) * llama_decode_job_get_layers(ctx_tgt);
+            }
 
             if (ret != LLAMA_DECODE_JOB_YIELDED) {
                 break;
@@ -5095,9 +5126,15 @@ private:
 
         llama_decode_job_info info = {};
         llama_decode_job_get_info(ctx_tgt, &info);
-        LOG_WRN("TU job: slot %d, tokens %d, ubatches %d, groups %d, peer rounds %d, joint rounds %d, service ms %.1f, drafter ms %.1f, overhead ms %.1f, longest slice ms %.1f, rs_idx %d, steps %d\n",
+        if (tu_job.group_rowlayers > 0.0) {
+            tu_adapt.id_slot = slot.id;
+            tu_adapt.id_task = slot.task ? slot.task->id : -1;
+            tu_adapt.ms_rl   = tu_job.group_ms / tu_job.group_rowlayers;
+        }
+        LOG_WRN("TU job: slot %d, tokens %d, ubatches %d, groups %d, peer rounds %d, joint rounds %d, service ms %.1f, drafter ms %.1f, overhead ms %.1f, longest slice ms %.1f, rs_idx %d, steps %d, group us/row-layer %.1f, next rows %d\n",
                 slot.id, info.n_tokens, info.n_ubatches, info.n_groups, tu_job.peer_rounds, tu_job.joint_rounds,
-                tu_job.service_ms, tu_job.drafter_ms, info.t_host_ms, tu_job.longest_slice_ms, info.rs_idx, tu_job.steps);
+                tu_job.service_ms, tu_job.drafter_ms, info.t_host_ms, tu_job.longest_slice_ms, info.rs_idx, tu_job.steps,
+                1000.0*tu_adapt.ms_rl, tu_gen_job_rows_for(slot));
 
         tu_job.active = false;
         batch_tu.clear();
@@ -6023,7 +6060,7 @@ private:
                     const auto last_user_pos = spans.last_user_message_pos();
 
                     // [TAG_TU_GEN_JOB_ROWS] with a slot generating, a prompt job takes at most tu_gen_job_rows() rows
-                    const int32_t n_fill_slot = to_job && !generating.empty() ? std::min<int32_t>(n_fill, tu_gen_job_rows()) : n_fill;
+                    const int32_t n_fill_slot = to_job && !generating.empty() ? std::min<int32_t>(n_fill, tu_gen_job_rows_for(slot)) : n_fill;
                     // add prompt tokens for processing in the current batch
                     while (slot.prompt.n_tokens() < slot.task->n_tokens() && pb.size() < n_fill_slot) {
                         // get next token to process
