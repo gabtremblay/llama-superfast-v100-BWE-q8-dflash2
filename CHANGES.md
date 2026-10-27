@@ -331,3 +331,16 @@ re-read beside three other reads.
   room the restore is skipped and the entry stays, and the request goes through the admission check like any prompt.
   `LLAMA_CACHE_ROOM=0` restores as before; the `cache_restore_room` log line gives the entry, the room and the outcome.
 
+Measured on a 65,536-token pool with four slots and the prompt cache on, each case with its fix off then on:
+
+| Case | Fix off | Fix on |
+|---|---|---|
+| A (24k) idle; B shares A's first 5k and adds 17k | B takes A's slot; A goes to the cache (0.5 s) and back (0.8 s), pushing B out | B takes an empty slot; A's follow-up finds A in place |
+| Two slots generate 2,500 tokens while D (41k) arrives with 32k cells free | D is read for 75 s; the two generating requests fail with an HTTP 500 when the pool runs out | D is refused in 0.08 s (HTTP 400, the context-size error); both answers complete |
+| A (24k) cleared to the cache, then back with 21k free | the restore fails, C is cleared anyway and A is re-read: 26.4 s | C is saved and cleared first, A is restored: 4.4 s |
+
+With the pool full, the old code did not fail the late prompt but the slots already generating: their verify step found
+no cell, the batch was halved down to 2 rows, and the speculative batch bookkeeping threw. The first build of the
+admission check crashed the server on its first refusal (the two-user scheduler read the refused slot's task after
+its release); `tu_remaining()` now returns 0 for a slot without a task and the refusal clears the round's reader pick.
+
