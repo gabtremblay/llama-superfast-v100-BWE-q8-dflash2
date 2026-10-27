@@ -45,6 +45,7 @@ Against upstream at `403f06f`, one line each. The design, the measurements and t
 **Several agents at once**
 
 - **The two-user scheduler with DFlash2 on a unified cache**: a side prompt is read beside the generating slot from the moment it arrives, and the generating slot gets more rounds per group as the read deepens. ([§8](CHANGES.md#8-the-two-user-scheduler-with-dflash2-on-a-unified-cache))
+- **A full pool fails fast and keeps what it holds**: a prompt that cannot fit is refused at once, a request never pushes out a big conversation while a slot is empty, and a returning conversation gets room before its restore. ([§17](CHANGES.md#17-a-full-pool-the-slot-kept-the-prompt-that-cannot-fit-refused-room-made-for-a-restore))
 - **Vision with the scheduler on**: a loaded projector no longer turns the scheduler off; only a prompt holding media pauses the other slots. ([Vision](#vision))
 - **Two or more cards by code reading**: every addition adapted to upstream's tensor-parallel path, untested here. ([below](#two-or-four-cards-tensor-parallel-untested))
 
@@ -302,8 +303,10 @@ What was measured, on the build before the replay (four slots, the shared snapsh
   32 GB host. A restart loses every cached conversation, so the next prompt of a long conversation is read in full (a
   190k-token conversation took 6 minutes).
 - The cache's save copies a conversation that leaves its slot while every slot waits, ~0.64 s for 47k tokens.
-- A prompt is admitted when a slot is free, not when the pool can hold it: one that cannot fit beside the others (126k
-  tokens beside a 188k-token conversation) is read until the pool runs out, then fails.
+- A prompt that cannot fit the pool beside the other conversations is refused at once with the context-size error
+  ([section 17](CHANGES.md#17-a-full-pool-the-slot-kept-the-prompt-that-cannot-fit-refused-room-made-for-a-restore)):
+  the client has to compact it or wait. Each agent's conversation counts against the one pool, so a client that
+  lets every conversation grow toward 262,144 tokens (opencode's `limit.context`) runs into it with several agents.
 - Two or more cards (`--split-mode tensor`) are supported by code reading only (the section after `## Run`): nothing
   here has run on more than one card.
 

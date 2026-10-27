@@ -308,3 +308,26 @@ rollback; `=2` also checks a replay of several slots against each slot's own).
   262,144.
 - The checkpoint 4 tokens before a prompt's end (section 10) replays into a scratch row instead of reading a snapshot.
 - The pool's plan, locks and re-packing are off under the replay; the spare cell of section 13 stays.
+
+## 17. A full pool: the slot kept, the prompt that cannot fit refused, room made for a restore
+
+Four agents on the 262,144-token pool held about 105k, 93k, 58k and 22k tokens: two prompt reads ran for minutes
+beside the generating slots and failed when the pool ran out ("Context size has been exceeded"), the 58k request's
+retry took by prompt similarity the slot of a 94k-token conversation idle between two of its turns while another slot
+was empty, and that conversation, back a second later, could not be restored (94k free cells were not there) and was
+re-read beside three other reads.
+
+- **Slot choice.** While a slot is empty, a request no longer takes by similarity a slot whose conversation it would
+  mostly discard: it must keep `LLAMA_SLOT_SIM_KEEP` of it (default 0.5; 0: upstream's rule), else the choice falls to
+  the least recently used slot, which prefers an empty one.
+- **Admission.** A prompt is read only if its new tokens, a margin for its answer (`LLAMA_KV_ADMIT_MARGIN`, default
+  2048) and what the other slots still have to read fit the pool's free cells after the packing and the allowed
+  evictions (`llama_kv_n_free`); else it is refused at once with the context-size error, so the client can compact or
+  retry instead of waiting for a read that cannot finish. It runs before each chunk of a long read, so of two reads
+  that cannot both fit, one goes on. The generating slots' growth is not reserved: a prompt that fits now is read.
+  `LLAMA_KV_ADMIT=0` turns it off; the `kv_admit_refused` log line gives what was needed and what was free.
+- **Restore.** Before a cached conversation is restored into a slot, the idle conversations shorter than it are cleared
+  (saved first, the least recently used first) until the pool holds it, and the idle conversations pack down; with no
+  room the restore is skipped and the entry stays, and the request goes through the admission check like any prompt.
+  `LLAMA_CACHE_ROOM=0` restores as before; the `cache_restore_room` log line gives the entry, the room and the outcome.
+
