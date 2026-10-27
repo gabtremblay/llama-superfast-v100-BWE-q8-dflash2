@@ -195,7 +195,8 @@ What the settings do:
 - `-b 2048` equal to `-ub` keeps the DFlash2 features on the GPU during prefill ([section 3](CHANGES.md#3-prompt-work-kept-on-the-gpu)).
 - `--spec-draft-ubatch 512` sizes the draft's compute buffer for 512-token batches, which frees 1.7 GB.
 - `--cache-ram 15360 --no-cache-idle-slots` ([section 16](CHANGES.md#16-the-prompt-cache-gives-back-the-conversations-that-left-the-slots)): a host prompt cache of
-  15 GiB for the conversations that leave the slots. One cleared from the pool for a bigger prompt, or replaced in its
+  15 GiB for the conversations that leave the slots. **`--cache-ram 15360` is sized for a host with 32 GB of RAM; with
+  less, lower it.** One cleared from the pool for a bigger prompt, or replaced in its
   slot, is restored when it comes back: 0.97 s for 24k tokens over this link, against a re-read of 26 s. The save
   pauses the server once, ~0.64 s for 47k tokens; conversations under 8,192 tokens are not saved
   (`LLAMA_CACHE_MIN_TOKENS`), and the cache drops its oldest entries to keep 4 GiB of the host's memory available
