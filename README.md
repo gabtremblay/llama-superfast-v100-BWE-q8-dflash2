@@ -44,14 +44,15 @@ fork runs the [Run](#run) line below.
 
 | | Upstream, f16 KV | This fork, `q8_0` KV |
 |---|---|---|
-| Cold prefill, ~8k-token prompt | 880 tok/s | 975 tok/s |
+| Cold prefill, ~8k-token prompt | 880 tok/s | 981 tok/s |
 | Cold prefill, ~48k-token prompt | 797 tok/s | 831 tok/s |
-| Time to first token, new ~125-token chat turn (median) | 657 ms | 260 ms |
-| Decode, 400 tokens, three prompts | 95 / 93 / 99 tok/s | 91 / 90 / 115 tok/s |
+| Time to first token, new ~125-token chat turn (median) | 657 ms | 262 ms |
+| Decode, 400 tokens, three prompts | 95 / 93 / 99 tok/s | 86 / 85 / 109 tok/s |
 | Context | 2 concurrent slots of 65,536 each | 4 concurrent slots sharing one 262,144-token pool (`--kv-unified`) |
 
-Decode on the first two prompts is 3–4% slower, the cost of reading an 8-bit cache, in exchange for twice the context;
-the third prompt's rate moves with how many draft tokens it accepts (the probe decodes greedily).
+Decode on the first two prompts is ~9% slower (the 8-bit cache, four slots instead of two, and the rollback's replay of
+section 15) in exchange for twice the context and four slots; the third prompt's rate moves with how many draft tokens
+it accepts (the probe decodes greedily). BetterBench's weighted decode below puts the gap at 3%.
 
 Upstream's two-user scheduler refuses DFlash2 prompt jobs, so there a side request's prompt waits until the other slot
 finishes generating. Here it starts at once and the generating slot keeps ~34 tok/s while it is read (section 8).
@@ -64,15 +65,15 @@ cache grew under traffic (section 5). This fork runs the [Run](#run) line: four 
 
 | BetterBench | Upstream, f16 KV, 2 × 49,152 | This fork, `q8_0` KV, 4 slots on 262,144 |
 |---|---|---|
-| Single-stream decode (weighted median) | 108.9 tok/s | 101.1 tok/s |
+| Single-stream decode (weighted median) | 108.9 tok/s | 105.5 tok/s |
 | Time to first token, single stream (p50) | 610 ms | 191 ms |
 | Cold prefill, 12k / 24k / 47k-token prompts | 877 / 858 / 795 tok/s | 963 / 915 / 830 tok/s |
 | Aggregate decode, 1 / 2 / 4 / 8 requests in flight | 90 / 101 / 89 / 88 tok/s | 88 / 91 / 158 / 154 tok/s |
 | Time to first token with 2 / 4 / 8 in flight (p50) | 2.3 s / 12.1 s / 32.7 s | 0.36 s / 0.37 s / 9.2 s |
 | Peak VRAM over the run | 31,044 MiB at 98,304 tokens | 32,028 MiB at 262,144 tokens |
 
-A lone stream decodes 7% slower: the 8-bit cache, and the rollback's replay (section 15) that pays for the context.
-Everything else is ahead: the first token three times sooner, prompts read 5–10% faster, 2.7× the context, and with
+A lone stream decodes 3% slower, the cost of the 8-bit cache (the rollback's replay of section 15 runs under the draft
+and costs it under 1%). Everything else is ahead: the first token three times sooner, prompts read 5–10% faster, 2.7× the context, and with
 four or eight requests in flight 1.75× the throughput, while the fourth request starts in 0.4 s instead of 12 s and the
 eighth in 9 s instead of 33 s (upstream's two slots serve eight requests four at a time). The 262,144-token pool peaks
 at ~32.0 GB of the card's 32.5 over the run.
@@ -454,11 +455,16 @@ rollback; `=2` also checks a replay of several slots against each slot's own).
   inputs, so after its first run a replay is inputs and a CUDA graph launch (0.3 ms of host time); the kernel reads
   each slot's kept row in place and writes its live row itself (the `set_rows` after it is fused into the launch, the
   rows read from a device table), so a replay moves each state row once.
-- What a replay costs is the GDN kernel's serial pass over the replayed tokens (about 4 us a token a layer) and a
-  dozen small kernels a layer: 101.1 tok/s single stream against 106.1 with the pool's snapshots (BetterBench's
-  combined decode), and 158.1 / 153.9 tok/s aggregate with four / eight requests in flight against the pool's
-  145.6 / 144.3; the rows are 10 instead of 17, 1.0 GB back, which is what takes the pool from 245,760 tokens to the
-  model's 262,144.
+- The replay runs on its own backend instance (its own CUDA stream), launched from `seq_rm`, so its GPU time (the
+  GDN kernel's serial pass over the replayed tokens, about 4 us a token a layer, and a dozen small kernels a layer)
+  overlaps the draft's work instead of running ahead of the next verify graph. Events order it: the side stream first
+  waits for the main stream's enqueued graphs (a pipelined decode may still read the rows), the main stream waits for
+  the replay before its next graph, and host-side readers of the rows (row copies, the checkpoint view) wait on the
+  host. `LLAMA_RS_REPLAY_SIDE=0` keeps the replay on the main stream, batched before the decode (then the cost is
+  about 1.5 ms a round, 4% of a lone stream). BetterBench: 105.5 tok/s single stream against 106.1 with the pool's
+  snapshots, 158.1 / 153.9 tok/s aggregate with four / eight requests in flight against the pool's 145.6 / 144.3;
+  the rows are 10 instead of 17, 1.0 GB back, which is what takes the pool from 245,760 tokens to the model's
+  262,144.
 - The checkpoint 4 tokens before a prompt's end (section 10) replays into a scratch row instead of reading a snapshot.
 - The pool's plan, locks and re-packing are off under the replay; the spare cell of section 13 stays.
 
