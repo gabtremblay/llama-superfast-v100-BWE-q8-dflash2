@@ -386,9 +386,19 @@ struct server_slot {
         const int64_t t2 = ggml_time_us();
 
         const int64_t lcp = next ? (int64_t) prompt.tokens.get_common_prefix(*next) : -1;
-        size_t n_moved = 0;
+        // [TAG_CACHE_CKPT_KEEP] the entry takes the conversation's newest checkpoints only (LLAMA_CACHE_CKPT_KEEP, default 2):
+        // a returning conversation resumes from its end or its newest checkpoint, an older one only shortens the re-read of a
+        // history edited in the middle, and each is 150 MiB (a 48k-token entry was 4.5 GiB, about half of it checkpoints,
+        // whose pinned blocks the slots then replaced with anonymous memory). The ones left stay with the slot, which
+        // erases them when its next prompt starts past them
+        const int64_t ckpt_min = server_prompt_cache_ckpt_min(prompt.checkpoints);
+        size_t n_moved   = 0;
+        size_t n_skipped = 0;
         for (auto it = prompt.checkpoints.begin(); it != prompt.checkpoints.end();) {
-            if (next && it->n_tokens > lcp) {
+            if (it->n_tokens < ckpt_min) {
+                ++n_skipped;
+                ++it;
+            } else if (next && it->n_tokens > lcp) {
                 auto nx = std::next(it);
                 cur->prompt.checkpoints.splice(cur->prompt.checkpoints.end(), prompt.checkpoints, it);
                 it = nx;
@@ -399,9 +409,9 @@ struct server_slot {
             }
         }
 
-        SRV_TRC(" - prompt saved: alloc %.1f ms, state %.1f ms (%.1f MiB), checkpoints %.1f ms (%zu moved, %zu copied)\n",
+        SRV_TRC(" - prompt saved: alloc %.1f ms, state %.1f ms (%.1f MiB), checkpoints %.1f ms (%zu moved, %zu copied, %zu left out)\n",
                 (t1 - t0) / 1e3, (t2 - t1) / 1e3, cur_size / 1048576.0, (ggml_time_us() - t2) / 1e3,
-                n_moved, cur->prompt.checkpoints.size() - n_moved);
+                n_moved, cur->prompt.checkpoints.size() - n_moved, n_skipped);
 
         return true;
     }

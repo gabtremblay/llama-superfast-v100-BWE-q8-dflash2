@@ -13,6 +13,8 @@
 #include <sstream>
 #include <fstream>
 #include <cstdint>
+#include <algorithm>
+#include <functional>
 
 //
 // task_params
@@ -1728,6 +1730,27 @@ static size_t cache_host_mem_available() {
     return SIZE_MAX;
 }
 
+// [TAG_CACHE_CKPT_KEEP]
+int64_t server_prompt_cache_ckpt_min(const std::list<common_prompt_checkpoint> & checkpoints) {
+    static const int32_t keep = [] {
+        const char * e = getenv("LLAMA_CACHE_CKPT_KEEP");
+        return e ? atoi(e) : 2;
+    }();
+    if (keep < 0 || checkpoints.size() <= (size_t) keep) {
+        return INT64_MIN;
+    }
+    if (keep == 0) {
+        return INT64_MAX;
+    }
+    std::vector<int64_t> n;
+    n.reserve(checkpoints.size());
+    for (const auto & c : checkpoints) {
+        n.push_back(c.n_tokens);
+    }
+    std::nth_element(n.begin(), n.begin() + (keep - 1), n.end(), std::greater<int64_t>());
+    return n[keep - 1];
+}
+
 server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & prompt, size_t state_size_tgt, size_t state_size_dft, size_t state_size_spec) {
     // first check if the current state is contained fully in the cache
     for (auto it = states.begin(); it != states.end(); ++it) {
@@ -1739,10 +1762,13 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
         }
     }
 
-    // calculate checkpoints size to see if it will fit with the prompt
+    // calculate checkpoints size to see if it will fit with the prompt: the ones the entry keeps (TAG_CACHE_CKPT_KEEP)
     size_t checkpoints_size = 0;
+    const int64_t ckpt_min = server_prompt_cache_ckpt_min(prompt.checkpoints);
     for (const auto & ckpt : prompt.checkpoints) {
-        checkpoints_size += ckpt.size();
+        if (ckpt.n_tokens >= ckpt_min) {
+            checkpoints_size += ckpt.size();
+        }
     }
 
     const size_t state_size_new = state_size_tgt + state_size_dft + state_size_spec + checkpoints_size;

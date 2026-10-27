@@ -632,6 +632,10 @@ struct server_prompt_cache_state {
     }
 };
 
+// [TAG_CACHE_CKPT_KEEP] the smallest n_tokens of the checkpoints a prompt-cache entry keeps from these: the newest
+// LLAMA_CACHE_CKPT_KEEP (default 2; negative: all, INT64_MIN; 0: none, INT64_MAX)
+int64_t server_prompt_cache_ckpt_min(const std::list<common_prompt_checkpoint> & checkpoints);
+
 struct server_prompt_cache {
     server_prompt_cache(int32_t limit_size_mib, size_t limit_tokens) {
         this->limit_size   = 1024ull*1024ull*(limit_size_mib < 0 ? 0 : limit_size_mib);

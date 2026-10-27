@@ -276,6 +276,14 @@ recurrent state and tail checkpoint, ~300 MiB over the link; 248 ms for a 612-to
 The production launcher runs `--cache-ram 15360 --no-cache-idle-slots` and 16 checkpoints per slot (the default 32
 reserved 19.6 GB of pinned host memory).
 
+An entry keeps only its conversation's newest `LLAMA_CACHE_CKPT_KEEP` checkpoints (default 2; negative: all). Each is
+150 MiB of the recurrent state: a 48k-token entry was 4.5 GiB, about half of it checkpoints, so the 15 GiB cache held
+three such conversations, and the entries' checkpoint blocks came from the pinned reserve, so the slots' next checkpoints
+took fresh anonymous memory the cache does not count (under four vision agents the host went down to 3.1 GB available
+and 2.9 GB of swap before the guard dropped two entries). A returning conversation resumes from its end or its newest
+checkpoint; an older checkpoint only shortens the re-read of a history edited in the middle, which with the trim is
+read from the start up to the edit (the same answer, read again: ~1 s per 900 tokens alone, 1.3-3 s under load).
+
 ## 15. Rollback by replay: one state a slot instead of a snapshot a token
 
 A verify step runs the draft's 8 tokens through the recurrent layers at once, and the rollback to the accepted count
