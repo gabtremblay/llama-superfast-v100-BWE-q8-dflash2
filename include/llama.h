@@ -842,6 +842,9 @@ extern "C" {
     // [TAG_KV_PLACE_LOW] the tokens seq_id's prompt is about to add: a unified cache places it in the lowest free run that holds
     // them with room to grow, the largest only when none does
     LLAMA_API void     llama_kv_place_hint(struct llama_context * ctx, llama_seq_id seq_id, uint32_t n_tokens);
+    // [TAG_KV_PACK] move the given sequences' cells down over the free cells below them so the free space is one run (the idle
+    // slots' conversations and the prompt's own, before one of them would be cleared); returns the cells moved
+    LLAMA_API uint32_t llama_kv_pack_seqs(struct llama_context * ctx, const llama_seq_id * seqs, size_t n);
 
     // Copy all tokens that belong to the specified sequence to another sequence
     // p0 < 0 : [0,  p1]

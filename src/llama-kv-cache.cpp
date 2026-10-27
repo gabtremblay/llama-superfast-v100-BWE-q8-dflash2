@@ -1649,6 +1649,139 @@ bool llama_kv_cache::seq_compact(llama_seq_id seq_id, uint32_t n_next, const std
     return true;
 }
 
+// [TAG_KV_PACK] with four slots a prompt that cannot grow in place found the pool's free cells split into holes between the
+// conversations (a 25k-token prompt with 67k cells free, none of them a run of 41k), and an idle slot's conversation was
+// cleared for it (TAG_KV_EVICT_IDLE): that slot's next prompt re-read 18k tokens beside three generating slots, ~3 minutes.
+// Packing the movable cells down first makes the free space one run for a few ms of row copies
+uint32_t llama_kv_cache::seqs_pack(const std::vector<llama_seq_id> & seqs, const std::function<void()> & sync) {
+    if (!kv_window || n_stream != 1 || v_trans || seqs.empty()) {
+        return 0;
+    }
+    auto & cells = v_cells[0];
+    const uint32_t n_cells = cells.size();
+    const uint32_t top     = cells.used_max_p1();
+
+    // the plan over a shadow of the cell table: a cell is empty, fixed, or movable (one of the sequences, not shared)
+    std::vector<uint8_t> occ(top, 0);
+    for (uint32_t i = 0; i < top; ++i) {
+        if (cells.is_empty(i)) {
+            continue;
+        }
+        occ[i] = 1;
+        if (cells.seq_count(i) != 1) {
+            continue;
+        }
+        for (llama_seq_id s : seqs) {
+            if (cells.seq_has(i, s)) {
+                occ[i] = 2;
+                break;
+            }
+        }
+    }
+    struct move_t { uint32_t src, dst, n; };
+    std::vector<move_t> moves;
+    uint32_t dst = 0;
+    for (uint32_t src = 0; src < top; ++src) {
+        if (occ[src] != 2) {
+            continue;
+        }
+        while (dst < src && occ[dst] != 0) {
+            ++dst;
+        }
+        if (dst >= src) {
+            dst = src + 1; // in place; the next free cell is above it
+            continue;
+        }
+        occ[dst] = 1;
+        occ[src] = 0;
+        if (!moves.empty() && moves.back().src + moves.back().n == src && moves.back().dst + moves.back().n == dst) {
+            moves.back().n++;
+        } else {
+            moves.push_back({ src, dst, 1 });
+        }
+        ++dst;
+    }
+    if (moves.empty()) {
+        return 0;
+    }
+
+    // no decode may be reading or writing the cache while its rows move. A range moves down in chunks no longer than its
+    // distance, so a chunk's source and destination never overlap
+    sync();
+    auto move_rows = [&](ggml_tensor * t) {
+        for (const move_t & m : moves) {
+            const uint32_t gap = m.src - m.dst;
+            for (uint32_t off = 0; off < m.n; ) {
+                const uint32_t n = std::min(gap, m.n - off);
+                ggml_tensor s = *t;
+                s.ne[1]    = (int64_t) n;
+                s.data     = (char *) t->data + (size_t) (m.src + off)*t->nb[1];
+                s.view_src = t->view_src ? t->view_src : t;
+                ggml_tensor d = s;
+                d.data     = (char *) t->data + (size_t) (m.dst + off)*t->nb[1];
+                ggml_backend_tensor_copy(&s, &d);
+                off += n;
+            }
+        }
+    };
+    for (auto & layer : layers) {
+        for (ggml_tensor * t : { layer.k_stream[0], layer.v_stream[0] }) {
+            if (t == nullptr) {
+                continue;
+            }
+            // [TAG_KV_TP] a split stream's rows move on each device's own tensor (seq_compact)
+            const size_t n_dev = ggml_backend_meta_buffer_n_simple(t->buffer);
+            if (n_dev == 0) {
+                move_rows(t);
+                continue;
+            }
+            ggml_tensor * base = t->view_src ? t->view_src : t;
+            GGML_ASSERT(t->view_offs == 0 && base->ne[1] == t->ne[1]);
+            for (size_t dev = 0; dev < n_dev; ++dev) {
+                ggml_tensor * td = ggml_backend_meta_tensor_simple(t, dev);
+                if (td == nullptr) {
+                    td = ggml_backend_meta_tensor_simple(base, dev);
+                }
+                GGML_ASSERT(td != nullptr && td->ne[1] == t->ne[1] && "a split stream's per-device rows");
+                move_rows(td);
+            }
+        }
+    }
+    // the cell table follows, in the order of the moves (a destination is empty, or was vacated by an earlier move)
+    uint32_t n_moved = 0;
+    for (const move_t & m : moves) {
+        for (uint32_t off = 0; off < m.n; ++off) {
+            const uint32_t  src = m.src + off;
+            const uint32_t  dsti = m.dst + off;
+            const llama_pos p   = cells.pos_get(src);
+            llama_seq_id    sid = -1;
+            for (llama_seq_id s : seqs) {
+                if (cells.seq_has(src, s)) {
+                    sid = s;
+                    break;
+                }
+            }
+            GGML_ASSERT(sid >= 0 && cells.is_empty(dsti));
+            cells.rm(src);
+            cells.pos_set(dsti, p);
+            cells.seq_add(dsti, sid);
+            ++n_moved;
+        }
+    }
+    uint32_t head = 0;
+    while (head < n_cells && !cells.is_empty(head)) {
+        ++head;
+    }
+    v_heads[0] = head < n_cells ? head : 0;
+
+    static const bool wlog = getenv("LLAMA_KV_WINDOW_LOG") != nullptr;
+    if (wlog) {
+        fprintf(stderr, "kv pack: %u cells of %zu sequences moved down in %zu ranges, the used range now ends at %u\n",
+                n_moved, seqs.size(), moves.size(), cells.used_max_p1());
+    }
+    return n_moved;
+}
+
 // [TAG_TU_UNIFIED] only the sequence's own cells: in a unified cache the stream also holds the other slots' cells, which
 // their decodes between the job's groups add and remove
 uint64_t llama_kv_cache::tu_seq_hash(llama_seq_id seq_id) const {

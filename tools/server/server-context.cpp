@@ -5980,8 +5980,13 @@ private:
                     // start of the largest free run that holds it and the prompt; then the idle slots' conversations, the least
                     // recently used first and only those shorter than this prompt, are cleared (saved to the prompt cache when
                     // there is one) until it fits; a longer idle conversation is kept, its prefill costs more than this one's
-                    // window. LLAMA_KV_EVICT_IDLE=0 turns the clearing off
+                    // window. LLAMA_KV_EVICT_IDLE=0 turns the clearing off.
+                    // [TAG_KV_PACK] before anything is cleared, the idle slots' conversations and this slot's own cells move down
+                    // over the free cells below them, so the free space is one run: a conversation is cleared only when the pool
+                    // is short, not fragmented (a 25k-token prompt with 67k cells free in holes cleared an 18k-token conversation,
+                    // re-read 3 minutes later beside three generating slots). LLAMA_KV_PACK=0 turns the packing off
                     static const bool kv_evict_idle = [] { const char * e = getenv("LLAMA_KV_EVICT_IDLE"); return e ? atoi(e) != 0 : true; }();
+                    static const bool kv_pack       = [] { const char * e = getenv("LLAMA_KV_PACK");       return e ? atoi(e) != 0 : true; }();
                     if (params_base.kv_unified) {
                         const int32_t n_add = slot.task->n_tokens() - slot.prompt.n_tokens();
                         llama_kv_place_hint(ctx_tgt, slot.id, n_add > 0 ? (uint32_t) n_add : 0u); // [TAG_KV_PLACE_LOW]
@@ -5990,6 +5995,24 @@ private:
                             room = llama_kv_room(ctx_tgt, slot.id);
                             LOG_WRN("[scheduler] kv_compact_prefix: t_us=%" PRId64 " slot=%d cached=%d n_add=%d room=%u\n",
                                     ggml_time_us(), slot.id, slot.prompt.n_tokens(), n_add, room);
+                        }
+                        if (kv_pack && n_add > 0 && (uint64_t) n_add > room) {
+                            std::vector<llama_seq_id> seqs;
+                            for (auto & s : slots) {
+                                if (&s == &slot || (!s.is_processing() && !s.tu_owned)) {
+                                    seqs.push_back(s.id);
+                                }
+                            }
+                            const int64_t  t0    = ggml_time_us();
+                            const uint32_t moved = llama_kv_pack_seqs(ctx_tgt, seqs.data(), seqs.size());
+                            if (moved > 0) {
+                                room = llama_kv_room(ctx_tgt, slot.id);
+                                if ((uint64_t) n_add > room && llama_kv_compact_seq(ctx_tgt, slot.id, (uint32_t) n_add)) {
+                                    room = llama_kv_room(ctx_tgt, slot.id);
+                                }
+                                LOG_WRN("[scheduler] kv_pack: t_us=%" PRId64 " slot=%d moved=%u cells of %zu sequences in %.1f ms, n_add=%d room=%u\n",
+                                        ggml_time_us(), slot.id, moved, seqs.size(), (ggml_time_us() - t0)/1000.0, n_add, room);
+                            }
                         }
                         if (kv_evict_idle && n_add > 0 && (uint64_t) n_add > room) {
                             std::vector<server_slot *> idle;

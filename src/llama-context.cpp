@@ -2841,6 +2841,23 @@ bool llama_context::kv_compact_seq(llama_seq_id seq_id, uint32_t n_next) {
     return kv != nullptr && max_cells > 0 && kv->seq_compact(seq_id, n_next, [this] { synchronize(); }, max_cells);
 }
 
+// [TAG_KV_PACK]
+uint32_t llama_context::kv_pack_seqs(const llama_seq_id * seqs, size_t n) {
+    if (!cparams.kv_unified || n == 0) {
+        return 0;
+    }
+    llama_kv_cache * kv = nullptr;
+    if (auto * h = dynamic_cast<llama_memory_hybrid *>(memory.get())) {
+        kv = h->get_mem_attn();
+    } else {
+        kv = dynamic_cast<llama_kv_cache *>(memory.get());
+    }
+    if (kv == nullptr) {
+        return 0;
+    }
+    return kv->seqs_pack(std::vector<llama_seq_id>(seqs, seqs + n), [this] { synchronize(); });
+}
+
 // [TAG_KV_EVICT_IDLE]
 uint32_t llama_context::kv_room(llama_seq_id seq_id) const {
     if (!cparams.kv_unified) {
@@ -6877,6 +6894,10 @@ bool llama_kv_compact_seq(llama_context * ctx, llama_seq_id seq_id, uint32_t n_n
 
 void llama_kv_place_hint(llama_context * ctx, llama_seq_id seq_id, uint32_t n_tokens) {
     ctx->kv_place_hint(seq_id, n_tokens);
+}
+
+uint32_t llama_kv_pack_seqs(llama_context * ctx, const llama_seq_id * seqs, size_t n) {
+    return ctx->kv_pack_seqs(seqs, n);
 }
 
 void llama_rs_set_depths(llama_context * ctx, const uint32_t * depths, size_t n) {
