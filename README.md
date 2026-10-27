@@ -2,8 +2,8 @@
 
 A fork of [bitexploder/llama-superfast-v100](https://github.com/bitexploder/llama-superfast-v100), the llama.cpp fork
 tuned for the Tesla V100 (Volta, `sm_70`), made for **one V100 card**, a **single user**, **up to four concurrent slots**
-on a **unified KV cache**, and the **DFlash2 speculative draft**, with some ideas stolen from [ReVolta](https://github.com/Leonccaa/ReVolta): agentic work
-made palatable at the model's whole 262,144-token context on one 32 GB card.
+on a **unified KV cache**, and the **DFlash2 speculative draft**: agentic work made palatable at the model's whole
+262,144-token context on one 32 GB card. Some ideas were stolen from [ReVolta](https://github.com/Leonccaa/ReVolta).
 
 The model is Qwen3.8-27B (`UD-Q4_K_XL`) on a V100 PCIe 32 GB, decoded with [DFlash2](https://github.com/z-lab/dflash),
 z-lab's speculative draft for it: a small draft model that reads the target's own layer inputs and proposes a block of
