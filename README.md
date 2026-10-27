@@ -22,27 +22,35 @@ insurance services to your clients, have a look at [inscora.com](https://inscora
 
 ## What this fork adds
 
-One line each, against upstream at `403f06f`. The design, the measurements and the switches of every item are in
-[CHANGES.md](CHANGES.md).
+Against upstream at `403f06f`, one line each. The design, the measurements and the switches of every item are in
+[CHANGES.md](CHANGES.md); the numbers are from one V100 PCIe 32 GB behind a PCIe Gen3 x4 eGPU link.
 
-1. **`q8_0` KV cache on the Volta attention kernels**: the CUTLASS prefill and the streaming verify kernels read 8-bit K/V directly, ~3% of decode for 2.7× the context. ([§1](CHANGES.md#1-q8_0-kv-cache-on-the-volta-attention-paths))
-2. **Faster prefill on repacked weights**: the fp16 expansion decodes straight from the repacked layout, products of 129–191 tokens go to MMQ. ([§2](CHANGES.md#2-faster-prefill-on-repacked-weights))
-3. **Prompt work kept on the GPU**: DFlash2 features, checkpoints and prompt-cache saves no longer cross the host link every ubatch. ([§3](CHANGES.md#3-prompt-work-kept-on-the-gpu))
-4. **Unified KV cache at the split cache's speed**: each batch attends over its own sequence's cells only, with device-built masks for every slot. ([§4](CHANGES.md#4-unified-kv-at-full-speed))
-5. **A capped CUDA graph cache**: 48 graphs for 120 s instead of 512 for 600 s, ~1.2 GB of VRAM that only grew under real traffic. ([§5](CHANGES.md#5-a-smaller-cuda-graph-cache))
-6. **Cell placement**: a conversation's cells stay one run of the shared pool, so its attention window stays tight. ([§6](CHANGES.md#6-cell-placement-in-a-unified-cache))
-7. **Build time**: the tensor-core matvec's ~1,000 kernels split into per-instance files, the 14-minute serial compile gone. ([§7](CHANGES.md#7-build-time))
-8. **The two-user scheduler with DFlash2 on a unified cache**: a side prompt is read beside the generating slot, which gets more rounds per group as the read deepens. ([§8](CHANGES.md#8-the-two-user-scheduler-with-dflash2-on-a-unified-cache))
-9. **Short prompts**: 32-token matvec passes and no CUDA graph capture for prompt shapes, the first token 15–20% sooner. ([§9](CHANGES.md#9-short-prompts-32-token-passes-no-graph-capture-for-prompts))
-10. **Checkpoints from the rollback state**: the tail checkpoint without a 50 ms decode of its own, two checkpoints kept on the device. ([§10](CHANGES.md#10-checkpoints))
-11. **Compaction of a boxed-in prefix**: up to 1,024 of a sequence's cells move before a ubatch that cannot grow in place. ([§11](CHANGES.md#11-compaction-of-a-boxed-in-prefix))
-12. **Four slots**: the verify rows budgeted across the generating slots, the draft run one width at a time. ([§12](CHANGES.md#12-four-slots-the-verify-rows-budgeted-the-draft-one-width-at-a-time))
-13. **A shared pool of rollback snapshots**: four slots in the memory of two; now behind `LLAMA_RS_REPLAY=0`. ([§13](CHANGES.md#13-a-shared-pool-of-rollback-snapshots))
-14. **A prompt's cells one run, low in the pool**: cached prefixes move, the idle conversations pack down before one is ever cleared, new conversations take the lowest run. ([§14](CHANGES.md#14-a-prompts-cells-stay-one-run-low-in-the-pool))
-15. **Rollback by replay on its own stream**: one kept state a slot and the accepted tokens replayed under the draft; 1.0 GB back, the pool at 262,144. ([§15](CHANGES.md#15-rollback-by-replay-one-state-a-slot-instead-of-a-snapshot-a-token))
-16. **The prompt cache gives back what left**: a conversation cleared for a bigger prompt is restored from host RAM when it returns, 0.97 s instead of a re-read of 26 s for 24k tokens. ([§16](CHANGES.md#16-the-prompt-cache-gives-back-the-conversations-that-left-the-slots))
-17. **Vision with the scheduler on**: a loaded projector no longer turns the two-user scheduler off; only a prompt holding media pauses the other slots. ([Vision](#vision))
-18. **Two or more cards by code reading**: every addition adapted to upstream's tensor-parallel path, untested here. ([below](#two-or-four-cards-tensor-parallel-untested))
+**Context: the model's whole 262,144 tokens on one 32 GB card, shared by four slots**
+
+- **`q8_0` KV cache on the Volta attention kernels**: the CUTLASS prefill and the streaming verify kernels read 8-bit K/V directly, ~3% of decode for 2.7× the context. ([§1](CHANGES.md#1-q8_0-kv-cache-on-the-volta-attention-paths))
+- **One unified pool at the split cache's speed**: each batch attends over its own sequence's cells only, with device-built masks for every slot. ([§4](CHANGES.md#4-unified-kv-at-full-speed))
+- **Rollback by replay on its own stream**: one kept recurrent state a slot and the draft's accepted tokens replayed under the draft, 1.0 GB back; the earlier shared snapshot pool stays behind `LLAMA_RS_REPLAY=0`. ([§15](CHANGES.md#15-rollback-by-replay-one-state-a-slot-instead-of-a-snapshot-a-token), [§13](CHANGES.md#13-a-shared-pool-of-rollback-snapshots))
+- **A capped CUDA graph cache**: 48 graphs for 120 s instead of 512 for 600 s, ~1.2 GB of VRAM that only grew under real traffic. ([§5](CHANGES.md#5-a-smaller-cuda-graph-cache))
+- **A conversation's cells stay one run of the pool**: placement right after its last cell or in the lowest free run, a boxed-in prefix moved before its ubatch, new conversations low in the pool. ([§6](CHANGES.md#6-cell-placement-in-a-unified-cache), [§11](CHANGES.md#11-compaction-of-a-boxed-in-prefix), [§14](CHANGES.md#14-a-prompts-cells-stay-one-run-low-in-the-pool))
+- **Nothing is cleared for a fragmented pool**: the idle conversations pack down (23.8k cells in 16 ms) before one is ever cleared for a prompt, and a conversation that is cleared comes back from host RAM in under a second instead of a re-read of minutes. ([§14](CHANGES.md#14-a-prompts-cells-stay-one-run-low-in-the-pool), [§16](CHANGES.md#16-the-prompt-cache-gives-back-the-conversations-that-left-the-slots))
+
+**Speed**
+
+- **Faster prefill on repacked weights**: the fp16 expansion decodes straight from the repacked layout, products of 129–191 tokens go to MMQ. ([§2](CHANGES.md#2-faster-prefill-on-repacked-weights))
+- **Prompt work kept on the GPU**: DFlash2 features, checkpoints and prompt-cache saves no longer cross the host link every ubatch. ([§3](CHANGES.md#3-prompt-work-kept-on-the-gpu))
+- **Short prompts**: 32-token matvec passes and no CUDA graph capture for prompt shapes, the first token 15–20% sooner. ([§9](CHANGES.md#9-short-prompts-32-token-passes-no-graph-capture-for-prompts))
+- **Checkpoints from the rollback state**: the tail checkpoint without a 50 ms decode of its own, two checkpoints kept on the device. ([§10](CHANGES.md#10-checkpoints))
+- **Four slots that share the verify step**: the verify rows budgeted across the generating slots, the draft run one width at a time; 158 tok/s aggregate with four requests in flight against 91 with upstream's two slots. ([§12](CHANGES.md#12-four-slots-the-verify-rows-budgeted-the-draft-one-width-at-a-time))
+
+**Several agents at once**
+
+- **The two-user scheduler with DFlash2 on a unified cache**: a side prompt is read beside the generating slot from the moment it arrives, and the generating slot gets more rounds per group as the read deepens. ([§8](CHANGES.md#8-the-two-user-scheduler-with-dflash2-on-a-unified-cache))
+- **Vision with the scheduler on**: a loaded projector no longer turns the scheduler off; only a prompt holding media pauses the other slots. ([Vision](#vision))
+- **Two or more cards by code reading**: every addition adapted to upstream's tensor-parallel path, untested here. ([below](#two-or-four-cards-tensor-parallel-untested))
+
+**Build**
+
+- **The tensor-core matvec's ~1,000 kernels in per-instance files**: the 14-minute serial compile gone, the longest file ~90 s. ([§7](CHANGES.md#7-build-time))
 
 ## Results
 
