@@ -11,6 +11,8 @@
 #include "server-common.h"
 
 #include <sstream>
+#include <fstream>
+#include <cstdint>
 
 //
 // task_params
@@ -1710,6 +1712,22 @@ size_t server_prompt_cache::n_tokens() const {
     return res;
 }
 
+// [TAG_CACHE_HOSTMEM] the host's MemAvailable in bytes (SIZE_MAX when it cannot be read: no guard)
+static size_t cache_host_mem_available() {
+#ifdef __linux__
+    std::ifstream f("/proc/meminfo");
+    std::string key;
+    size_t kb = 0;
+    std::string unit;
+    while (f >> key >> kb >> unit) {
+        if (key == "MemAvailable:") {
+            return kb * 1024;
+        }
+    }
+#endif
+    return SIZE_MAX;
+}
+
 server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & prompt, size_t state_size_tgt, size_t state_size_dft, size_t state_size_spec) {
     // first check if the current state is contained fully in the cache
     for (auto it = states.begin(); it != states.end(); ++it) {
@@ -1769,6 +1787,38 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
                 state_data_dft = std::move(old.drft);
             }
             states.pop_front();
+        }
+    }
+
+    // [TAG_CACHE_HOSTMEM] the host must keep LLAMA_CACHE_RESERVE_MIB (default 4096) available after the new entry: the
+    // cache's size counts its state vectors and checkpoints, not the checkpoint blocks its entries take from the pinned
+    // reserve (the slots' next checkpoints then take fresh anonymous memory) nor the recycle pool, and with --cache-ram
+    // 15360 beside the 10.5 GB pinned reserve the server held 20 GB of anonymous memory and was OOM-killed. The oldest
+    // entries go first; with none left and still no room, the save is skipped
+    {
+        static const size_t reserve = [] {
+            const char * e = getenv("LLAMA_CACHE_RESERVE_MIB");
+            return (size_t) (e ? std::max(0, atoi(e)) : 4096) << 20;
+        }();
+        const size_t need  = state_size_new + reserve;
+        size_t       avail = cache_host_mem_available();
+        auto room = [&]() {
+            const size_t reuse = state_data_tgt.capacity() + state_data_dft.capacity();
+            return avail == SIZE_MAX || avail + std::min(reuse, state_size_tgt + state_size_dft) >= need;
+        };
+        size_t n_dropped = 0;
+        while (!states.empty() && !room()) {
+            states.pop_front();
+            ++n_dropped;
+            avail = cache_host_mem_available();
+        }
+        if (!room()) {
+            SRV_WRN(" - host memory: %.0f MiB available, the entry needs %.0f MiB and %.0f MiB stay free: not saved (%zu entries dropped)\n",
+                    avail / 1048576.0, state_size_new / 1048576.0, reserve / 1048576.0, n_dropped);
+            return nullptr;
+        }
+        if (n_dropped > 0) {
+            SRV_WRN(" - host memory: %zu oldest entries dropped to keep %.0f MiB available\n", n_dropped, reserve / 1048576.0);
         }
     }
 

@@ -345,6 +345,16 @@ struct server_slot {
         if (prompt.tokens.size() == 0) {
             return false;
         }
+        // [TAG_CACHE_HOSTMEM] a short conversation is not saved: its re-read takes a few seconds, its save ~150 ms of the
+        // request that replaces it (the recurrent state and a tail checkpoint, ~300 MiB over the link), and one-off
+        // requests never come back (every single-stream request of a bench paid it). LLAMA_CACHE_MIN_TOKENS, default 8192
+        static const size_t min_tokens = [] {
+            const char * e = getenv("LLAMA_CACHE_MIN_TOKENS");
+            return (size_t) (e ? std::max(0, atoi(e)) : 8192);
+        }();
+        if (prompt.tokens.size() < min_tokens) {
+            return false;
+        }
 
         const int64_t t0 = ggml_time_us();
         const size_t cur_size_tgt =           llama_state_seq_get_size_ext(ctx_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE);
