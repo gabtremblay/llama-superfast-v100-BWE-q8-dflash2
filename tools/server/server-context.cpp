@@ -2287,6 +2287,7 @@ private:
 
                 const int64_t t_start = ggml_time_us();
                 const size_t  n_before = ret->prompt.tokens.size();
+                const size_t  lcp_before = ret->prompt.tokens.get_common_prefix(task.tokens);
 
                 const bool saved = ret->prompt_save(*prompt_cache, &task.tokens);
 
@@ -2299,7 +2300,7 @@ private:
                 const size_t n_after = ret->prompt.tokens.size();
                 const size_t lcp     = ret->prompt.tokens.get_common_prefix(task.tokens);
                 LOG_WRN("[scheduler] prompt_cache: t_us=%" PRId64 " slot=%d saved=%zu tokens, loaded=%d (%zu tokens, %zu of them this prompt's), entries=%zu (%.1f MiB), %.1f ms\n",
-                        ggml_time_us(), ret->id, saved ? n_before : (size_t) 0, n_after != n_before || lcp > 0 ? 1 : 0, n_after, lcp,
+                        ggml_time_us(), ret->id, saved ? n_before : (size_t) 0, lcp > lcp_before ? 1 : 0, n_after, lcp,
                         prompt_cache->states.size(), prompt_cache->size() / 1048576.0, (ggml_time_us() - t_start) / 1000.0);
             }
         }
