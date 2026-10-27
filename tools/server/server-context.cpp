@@ -5997,14 +5997,20 @@ private:
                                     ggml_time_us(), slot.id, slot.prompt.n_tokens(), n_add, room);
                         }
                         if (kv_pack && n_add > 0 && (uint64_t) n_add > room) {
+                            // the idle conversations first, then this slot's own cells on top of them, so the free space ends up
+                            // right after this slot (four of five clearings in one run were for follow-ups of 29-254 tokens on
+                            // a conversation another one sat right after, and each cleared a 37-52k-token conversation)
                             std::vector<llama_seq_id> seqs;
                             for (auto & s : slots) {
-                                if (&s == &slot || (!s.is_processing() && !s.tu_owned)) {
+                                if (&s != &slot && !s.is_processing() && !s.tu_owned) {
                                     seqs.push_back(s.id);
                                 }
                             }
                             const int64_t  t0    = ggml_time_us();
-                            const uint32_t moved = llama_kv_pack_seqs(ctx_tgt, seqs.data(), seqs.size());
+                            uint32_t       moved = seqs.empty() ? 0 : llama_kv_pack_seqs(ctx_tgt, seqs.data(), seqs.size());
+                            const llama_seq_id own = slot.id;
+                            moved += llama_kv_pack_seqs(ctx_tgt, &own, 1);
+                            seqs.push_back(own);
                             if (moved > 0) {
                                 room = llama_kv_room(ctx_tgt, slot.id);
                                 if ((uint64_t) n_add > room && llama_kv_compact_seq(ctx_tgt, slot.id, (uint32_t) n_add)) {
