@@ -1310,6 +1310,7 @@ private:
         int32_t steps           = 0;    // the job's llama_decode_job_step calls
         double group_ms         = 0.0;  // [TAG_TU_GEN_GROUP_MS] the job's measured groups: their time, and their rows x layers
         double group_rowlayers  = 0.0;
+        int32_t rounds_per_group = 1;   // [TAG_TU_GEN_ROUNDS] the generating slot's rounds between two of the job's groups
     } tu_job;
 
     // [TAG_TU_GEN_GROUP_MS] a group's time per row and layer as the last job measured it, with the read it belongs to: the
@@ -4655,12 +4656,16 @@ private:
     }
 
     // [TAG_TU_GEN_GROUP_MS] the rows of this slot's next job beside a generating slot: at most tu_gen_job_rows(), fewer once the
-    // read's groups measure longer than LLAMA_TU_GEN_GROUP_MS (default 55 ms; 0: the cap alone). A group of 1,024 rows and 4
-    // layers takes 82 ms at 8k tokens of depth and 138 ms at 125k (attention over the prompt read so far), and the generating
-    // slot, one round per group, fell from 40% of the card to 28%: 25 tok/s beside a 125k-token read. The first job of a read
-    // takes the cap (nothing measured yet). Rows are a multiple of 64, at least LLAMA_TU_GEN_JOB_ROWS_MIN (default 256)
+    // read's groups measure longer than LLAMA_TU_GEN_GROUP_MS (default 0: the cap alone). A group of 1,024 rows and 4 layers
+    // takes 82 ms at 8k tokens of depth and 138 ms at 125k (attention over the prompt read so far), and the generating slot,
+    // one round per group, fell from 40% of the card to 28%: 25 tok/s beside a 125k-token read. Fewer rows per group give the
+    // generating slot more rounds per token read, but a group's time has a part per group (the context's KV, ~27 ms of a
+    // 138 ms group at 120k) that fewer rows amortize worse: at 55 ms the read 375 -> 182 tok/s at 60-90k of depth for the
+    // generating slot 5.5 -> 9.3 rounds/s, at 80 ms 241 tok/s for 7.6. Off: the rounds per group (TAG_TU_GEN_ROUNDS) do it
+    // with the rows whole. The first job of a read takes the cap (nothing measured yet). Rows are a multiple of 64, at least
+    // LLAMA_TU_GEN_JOB_ROWS_MIN (default 256)
     int32_t tu_gen_job_rows_for(const server_slot & slot) const {
-        static const double  target_ms = [] { const char * e = getenv("LLAMA_TU_GEN_GROUP_MS"); return e ? atof(e) : 55.0; }();
+        static const double  target_ms = [] { const char * e = getenv("LLAMA_TU_GEN_GROUP_MS"); return e ? atof(e) : 0.0; }();
         static const int32_t rows_min  = [] { const char * e = getenv("LLAMA_TU_GEN_JOB_ROWS_MIN"); return e ? std::max(64, atoi(e)) : 256; }();
         const int32_t cap = tu_gen_job_rows();
         if (target_ms <= 0.0 || tu_adapt.ms_rl <= 0.0 || tu_adapt.id_slot != slot.id || slot.task == nullptr || tu_adapt.id_task != slot.task->id) {
@@ -4669,6 +4674,28 @@ private:
         const double  rows = target_ms / (tu_adapt.ms_rl * std::max(1, tu_policy.group));
         const int32_t r    = (int32_t) std::min<double>(cap, std::max<double>(rows_min, rows)) / 64 * 64;
         return std::max(rows_min, std::min(cap, r));
+    }
+
+    // [TAG_TU_GEN_ROUNDS] the generating slot's rounds between two groups of the job: one per LLAMA_TU_GEN_ROUND_MS (default 80)
+    // of the group's time (the last measured group of this ubatch, else the previous job's rate for this job's rows), at most
+    // LLAMA_TU_GEN_ROUNDS_MAX (default 4). A group of 1,024 rows takes 82 ms at 8k tokens of depth (one round, as before) and
+    // 138 ms at 125k (two), so the generating slot keeps ~40% of the card at depth instead of 28%, and the job's rows stay
+    // whole (TAG_TU_GEN_GROUP_MS on why)
+    int32_t tu_gen_rounds_per_group() const {
+        static const double  round_ms   = [] { const char * e = getenv("LLAMA_TU_GEN_ROUND_MS"); return e ? atof(e) : 80.0; }();
+        static const int32_t rounds_max = [] { const char * e = getenv("LLAMA_TU_GEN_ROUNDS_MAX"); return e ? std::max(1, atoi(e)) : 4; }();
+        if (round_ms <= 0.0) {
+            return 1;
+        }
+        double group = tu_job.last_group_ms;
+        if (group <= 0.0 && tu_job.slot != nullptr && tu_job.slot->task != nullptr && tu_adapt.ms_rl > 0.0 &&
+            tu_adapt.id_slot == tu_job.slot->id && tu_adapt.id_task == tu_job.slot->task->id) {
+            group = tu_adapt.ms_rl * std::min<int32_t>(batch_tu.size(), llama_n_ubatch(ctx_tgt)) * tu_job.layers;
+        }
+        if (group <= 0.0) {
+            return 1;
+        }
+        return std::max<int32_t>(1, std::min<int32_t>(rounds_max, (int32_t) std::floor(group/round_ms + 0.5)));
     }
 
     // the job begins over batch_tu, after this iteration's decode round, and runs its first slice
@@ -4725,7 +4752,8 @@ private:
         tu_slice();
     }
 
-    // while the job lives: the other slots' decode round (the same code as a lone or joint round), then one slice
+    // while the job lives: the other slots' decode round (the same code as a lone or joint round), then one slice; a slice
+    // whose groups are long waits for more rounds (TAG_TU_GEN_ROUNDS)
     void tu_update() {
         try {
             scoped_timer t(t_pre_decode, n_pre_decode);
@@ -4761,6 +4789,15 @@ private:
         }
 
         if (tu_job.active) {
+            // [TAG_TU_GEN_ROUNDS] with a round just run and a slot generating, the slice waits until the generating slot had its
+            // rounds since the job's last group; with no round this iteration the slice runs, so the job never waits on a
+            // round that does not come
+            if (batch.size() > 0 && tu_peer()) {
+                tu_job.rounds_per_group = tu_gen_rounds_per_group();
+                if (tu_job.n_rounds_pending < tu_job.rounds_per_group) {
+                    return;
+                }
+            }
             tu_slice();
         }
     }
@@ -5131,10 +5168,10 @@ private:
             tu_adapt.id_task = slot.task ? slot.task->id : -1;
             tu_adapt.ms_rl   = tu_job.group_ms / tu_job.group_rowlayers;
         }
-        LOG_WRN("TU job: slot %d, tokens %d, ubatches %d, groups %d, peer rounds %d, joint rounds %d, service ms %.1f, drafter ms %.1f, overhead ms %.1f, longest slice ms %.1f, rs_idx %d, steps %d, group us/row-layer %.1f, next rows %d\n",
+        LOG_WRN("TU job: slot %d, tokens %d, ubatches %d, groups %d, peer rounds %d, joint rounds %d, service ms %.1f, drafter ms %.1f, overhead ms %.1f, longest slice ms %.1f, rs_idx %d, steps %d, group us/row-layer %.1f, rounds per group %d, next rows %d\n",
                 slot.id, info.n_tokens, info.n_ubatches, info.n_groups, tu_job.peer_rounds, tu_job.joint_rounds,
                 tu_job.service_ms, tu_job.drafter_ms, info.t_host_ms, tu_job.longest_slice_ms, info.rs_idx, tu_job.steps,
-                1000.0*tu_adapt.ms_rl, tu_gen_job_rows_for(slot));
+                1000.0*tu_adapt.ms_rl, tu_job.rounds_per_group, tu_gen_job_rows_for(slot));
 
         tu_job.active = false;
         batch_tu.clear();
