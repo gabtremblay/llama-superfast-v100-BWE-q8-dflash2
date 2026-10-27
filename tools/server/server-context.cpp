@@ -2180,6 +2180,16 @@ private:
         if (slot_prompt_similarity != 0.0f) {
             float f_sim_best = 0;
 
+            // [TAG_SLOT_KEEP] while a slot is empty, a request does not take by similarity a slot whose conversation it would
+            // mostly discard: a 58k-token request with 11.5k tokens in common took the slot of a 94k-token conversation
+            // idle between two of its turns while slot 3 was empty, and that conversation, back a second later, could
+            // not be restored and was re-read. LLAMA_SLOT_SIM_KEEP: the share it must keep (default 0.5; 0: off)
+            static const float sim_keep = [] { const char * e = getenv("LLAMA_SLOT_SIM_KEEP"); return e ? (float) atof(e) : 0.5f; }();
+            bool have_empty = false;
+            for (const server_slot & s : slots) {
+                have_empty = have_empty || (!s.is_processing() && !s.tu_owned && s.prompt.tokens.empty());
+            }
+
             for (server_slot & slot : slots) {
                 if (task.id_slot != -1 && slot.id != task.id_slot) {
                     continue;
@@ -2202,6 +2212,11 @@ private:
                 // fraction of the Longest Common Prefix length with respect to the input prompt length
                 const size_t lcp_len = tokens.get_common_prefix(task.tokens);
                 const float f_sim_cur = float(lcp_len) / task.tokens.size();
+
+                if (task.id_slot == -1 && have_empty && sim_keep > 0.0f && float(lcp_len) < sim_keep * float(tokens.size())) {
+                    SLT_TRC(slot, " - skipping, would discard %zu of its %zu tokens while a slot is empty\n", tokens.size() - lcp_len, tokens.size());
+                    continue;
+                }
 
                 SLT_TRC(slot, " - checking sim = %.3f (%zu/%zu) > %.3f\n", f_sim_cur, lcp_len, task.tokens.size(), slot_prompt_similarity);
 
@@ -2301,7 +2316,51 @@ private:
 
                 const bool saved = ret->prompt_save(*prompt_cache, &task.tokens);
 
-                if (!ret->prompt_load(*prompt_cache, task.tokens)) {
+                // [TAG_CACHE_ROOM] a restore needs the pool to hold the entry's cells: the idle conversations shorter than it are
+                // cleared (saved first, the least recently used first) until it fits, then the idle conversations pack down so
+                // it lands in one run. With no room the restore is skipped and the entry stays: the request then goes through
+                // the admission check (TAG_KV_ADMIT) like any prompt. A 94k-token conversation's restore failed for want of
+                // 94k free cells and it was re-read beside three other reads
+                bool restore = true;
+                if (params_base.kv_unified) {
+                    const size_t n_entry = prompt_cache->restore_n_tokens(ret->prompt, task.tokens);
+                    uint32_t     n_free  = llama_kv_n_free(ctx_tgt);
+                    if (n_entry > 0 && n_free != UINT32_MAX) {
+                        const size_t n_own = ret->prompt.tokens.size(); // the restore replaces the slot's own cells
+                        std::vector<server_slot *> idle;
+                        for (auto & s : slots) {
+                            if (&s != ret && !s.is_processing() && !s.tu_owned && !s.prompt.tokens.empty() && s.prompt.tokens.size() < n_entry) {
+                                idle.push_back(&s);
+                            }
+                        }
+                        std::sort(idle.begin(), idle.end(), [](const server_slot * a, const server_slot * b) { return a->t_last_used < b->t_last_used; });
+                        size_t n_cleared = 0;
+                        for (server_slot * s : idle) {
+                            if ((size_t) n_free + n_own >= n_entry) {
+                                break;
+                            }
+                            n_cleared += s->prompt.tokens.size();
+                            s->prompt_save(*prompt_cache);
+                            s->prompt_clear();
+                            n_free = llama_kv_n_free(ctx_tgt);
+                        }
+                        restore = (size_t) n_free + n_own >= n_entry;
+                        uint32_t n_packed = 0;
+                        if (restore) {
+                            std::vector<llama_seq_id> seqs;
+                            for (auto & s : slots) {
+                                if (&s != ret && !s.is_processing() && !s.tu_owned) {
+                                    seqs.push_back(s.id);
+                                }
+                            }
+                            n_packed = seqs.empty() ? 0 : llama_kv_pack_seqs(ctx_tgt, seqs.data(), seqs.size());
+                        }
+                        LOG_WRN("[scheduler] cache_restore_room: t_us=%" PRId64 " slot=%d entry=%zu tokens, free=%u + own %zu, cleared=%zu, packed=%u: %s\n",
+                                ggml_time_us(), ret->id, n_entry, n_free, n_own, n_cleared, n_packed, restore ? "restore" : "no room, skipped");
+                    }
+                }
+
+                if (restore && !ret->prompt_load(*prompt_cache, task.tokens)) {
                     ret->prompt_clear();
                 }
 
@@ -6069,6 +6128,37 @@ private:
                                 }
                                 LOG_WRN("[scheduler] kv_evict_idle: t_us=%" PRId64 " slot=%d cleared=%zu for_slot=%d n_add=%d room=%u\n",
                                         ggml_time_us(), s->id, n_was, slot.id, n_add, room);
+                            }
+                        }
+
+                        // [TAG_KV_ADMIT] the prompt is read only if the pool can hold it beside the others: its new tokens, a
+                        // margin for its answer (LLAMA_KV_ADMIT_MARGIN, default 2048) and what the other slots still have to
+                        // read, against the pool's free cells after the packing and the evictions above (this runs before each
+                        // chunk of a long read, so of two reads that cannot both fit, one goes on). Else it is
+                        // refused now with the context-size error, instead of read for minutes beside the other slots and
+                        // failed when the pool runs out (a 58k-token and a 22k-token read beside a 105k and a 93k conversation
+                        // in a 262,144-token pool). LLAMA_KV_ADMIT=0 turns it off
+                        static const bool    kv_admit     = [] { const char * e = getenv("LLAMA_KV_ADMIT"); return e ? atoi(e) != 0 : true; }();
+                        static const int64_t admit_margin = [] { const char * e = getenv("LLAMA_KV_ADMIT_MARGIN"); return (int64_t) (e ? std::max(0, atoi(e)) : 2048); }();
+                        const uint32_t n_free = llama_kv_n_free(ctx_tgt);
+                        if (kv_admit && n_add > 0 && n_free != UINT32_MAX) {
+                            int64_t need = n_add + admit_margin;
+                            for (const auto & s : slots) {
+                                if (&s == &slot || !s.is_processing() || s.task == nullptr) {
+                                    continue;
+                                }
+                                need += std::max<int64_t>(0, (int64_t) s.task->n_tokens() - (int64_t) s.prompt.n_tokens());
+                            }
+                            if ((int64_t) n_free < need) {
+                                LOG_WRN("[scheduler] kv_admit_refused: t_us=%" PRId64 " slot=%d id_task=%d n_add=%d need=%" PRId64 " free=%u\n",
+                                        ggml_time_us(), slot.id, slot.task->id, n_add, need, n_free);
+                                send_error(slot,
+                                           string_format("request (%d tokens) exceeds the available context size: %d new tokens do not fit "
+                                                         "the KV pool beside the other conversations (%u cells free, %" PRId64 " needed)",
+                                                         slot.task->n_tokens(), n_add, n_free, need),
+                                           ERROR_TYPE_EXCEED_CONTEXT_SIZE);
+                                slot.release();
+                                return;
                             }
                         }
                     }

@@ -202,6 +202,9 @@ public:
     // the largest free run when it has none (the placement of find_slot). The cache size when the window placement is off
     uint32_t seq_room(llama_seq_id seq_id) const;
 
+    // [TAG_KV_ADMIT] the empty cells of a unified cache's stream (UINT32_MAX when the window placement is off)
+    uint32_t n_free() const;
+
     // [TAG_KV_PLACE_LOW] the tokens a sequence's prompt is about to add: find_slot and seq_compact then pick the lowest free run
     // that holds them with room to grow (LLAMA_KV_PLACE_MARGIN cells, default 16384), the largest run only when none does,
     // so conversations stack from the bottom of the pool and the cells a decode reads (the used range) stay low

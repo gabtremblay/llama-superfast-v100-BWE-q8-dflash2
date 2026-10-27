@@ -1504,6 +1504,14 @@ void llama_kv_cache::seq_place_hint(llama_seq_id seq_id, uint32_t n_tokens) {
 }
 
 // [TAG_KV_EVICT_IDLE]
+// [TAG_KV_ADMIT]
+uint32_t llama_kv_cache::n_free() const {
+    if (!kv_window || n_stream != 1) {
+        return UINT32_MAX;
+    }
+    return v_cells[0].size() - v_cells[0].get_used();
+}
+
 uint32_t llama_kv_cache::seq_room(llama_seq_id seq_id) const {
     if (!kv_window || n_stream != 1 || seq_id < 0) {
         return v_cells[0].size();

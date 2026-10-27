@@ -1854,6 +1854,32 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
     return &states.back();
 }
 
+// [TAG_CACHE_ROOM] the same choice as load(), without touching anything
+size_t server_prompt_cache::restore_n_tokens(const server_prompt & prompt, const server_tokens & tokens_new) const {
+    const int lcp_best = prompt.tokens.get_common_prefix(tokens_new);
+
+    float f_keep_best = prompt.tokens.size() > 0 ? float(lcp_best) / prompt.tokens.size() : -1.0f;
+    float f_sim_best  = float(lcp_best) / tokens_new.size();
+
+    size_t n_best = 0;
+    for (auto it = states.begin(); it != states.end(); ++it) {
+        const int lcp_cur = it->prompt.tokens.get_common_prefix(tokens_new);
+
+        const float f_keep_cur = float(lcp_cur) / it->prompt.tokens.size();
+        const float f_sim_cur  = float(lcp_cur) / tokens_new.size();
+
+        if (f_keep_cur < 0.25f) {
+            continue;
+        }
+        if (f_keep_best < f_keep_cur && f_sim_best < f_sim_cur) {
+            f_keep_best = f_keep_cur;
+            f_sim_best  = f_sim_cur;
+            n_best      = it->prompt.tokens.size();
+        }
+    }
+    return n_best;
+}
+
 bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot,
                                bool * loaded, std::vector<uint8_t> * spec) {
     if (loaded) {

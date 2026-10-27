@@ -836,6 +836,8 @@ extern "C" {
     // [TAG_KV_EVICT_IDLE] the tokens seq_id can add to a unified KV cache while its cells stay one run: the free cells after
     // its last cell, or the largest free run when it has none. UINT32_MAX when the cache does not place by window
     LLAMA_API uint32_t llama_kv_room(struct llama_context * ctx, llama_seq_id seq_id);
+    // [TAG_KV_ADMIT] the empty cells of a unified KV cache (UINT32_MAX when it does not place by window)
+    LLAMA_API uint32_t llama_kv_n_free(struct llama_context * ctx);
     // [TAG_KV_COMPACT] move seq_id's cells (at most LLAMA_KV_COMPACT_MAX of them) to the start of the largest free run when that
     // run holds them and n_next more tokens and they cannot grow in place; true when they moved
     LLAMA_API bool     llama_kv_compact_seq(struct llama_context * ctx, llama_seq_id seq_id, uint32_t n_next);

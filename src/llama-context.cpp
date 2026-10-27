@@ -2867,6 +2867,20 @@ uint32_t llama_context::kv_pack_seqs(const llama_seq_id * seqs, size_t n) {
     return kv->seqs_pack(std::vector<llama_seq_id>(seqs, seqs + n), [this] { synchronize(); }, be);
 }
 
+// [TAG_KV_ADMIT]
+uint32_t llama_context::kv_n_free() const {
+    if (!cparams.kv_unified) {
+        return UINT32_MAX;
+    }
+    const llama_kv_cache * kv = nullptr;
+    if (auto * h = dynamic_cast<llama_memory_hybrid *>(memory.get())) {
+        kv = h->get_mem_attn();
+    } else {
+        kv = dynamic_cast<llama_kv_cache *>(memory.get());
+    }
+    return kv != nullptr ? kv->n_free() : UINT32_MAX;
+}
+
 // [TAG_KV_EVICT_IDLE]
 uint32_t llama_context::kv_room(llama_seq_id seq_id) const {
     if (!cparams.kv_unified) {
@@ -6895,6 +6909,10 @@ uint32_t llama_rs_set_depth(llama_context * ctx, llama_seq_id seq_id, uint32_t d
 // [TAG_KV_EVICT_IDLE]
 uint32_t llama_kv_room(llama_context * ctx, llama_seq_id seq_id) {
     return ctx->kv_room(seq_id);
+}
+
+uint32_t llama_kv_n_free(llama_context * ctx) {
+    return ctx->kv_n_free();
 }
 
 bool llama_kv_compact_seq(llama_context * ctx, llama_seq_id seq_id, uint32_t n_next) {

@@ -660,6 +660,9 @@ struct server_prompt_cache {
               bool * loaded = nullptr, std::vector<uint8_t> * spec = nullptr);
 
     void update();
+
+    // [TAG_CACHE_ROOM] the tokens of the entry load() would restore for tokens_new into a slot holding prompt (0: none)
+    size_t restore_n_tokens(const server_prompt & prompt, const server_tokens & tokens_new) const;
 };
 
 // used exclusively by router mode
