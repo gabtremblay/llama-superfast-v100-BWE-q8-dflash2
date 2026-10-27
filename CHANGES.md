@@ -247,6 +247,23 @@ of section 11 skipped those prefixes (its 1,024-cell cap).
   17.8k-token conversations were cleared and 41.6k tokens re-read (47 s); with it 23,739 cells moved in 24.4 ms and
   nothing was cleared, the others' follow-ups fully cached, their greedy answers identical to a fresh read.
   `LLAMA_KV_PACK=0` turns it off; the `kv_pack` log line gives the cells moved, the time and the room gained.
+  The copies go to the device backend's stream and synchronize once: a move by a short distance is cut into chunks no
+  longer than that distance, and the synchronous copy (one synchronize each) took 1.5 s for 23.7k cells moved by 2,048.
+
+## 16. The prompt cache gives back the conversations that left the slots
+
+With `--cache-ram` and `--no-cache-idle-slots`, the host prompt cache held what `kv_evict_idle` saved before clearing a
+conversation and never read it back: slot selection refused every cache use with idle-slot caching off, and with it
+on (the server's default) every idle slot's conversation was saved and cleared at every new task, then restored on its
+next request, ~0.5 s each way over the eGPU link for 40k tokens, a pause of all slots. Now, with idle-slot caching off,
+a slot chosen by LRU, or whose conversation the prompt would mostly discard, saves its own conversation and loads a
+better entry when the cache holds one (`server_prompt_cache::load` takes only a strictly better entry and consumes
+it), whether or not a peer is busy; nothing is saved or cleared otherwise. The LRU choice prefers an empty slot, so a
+returning conversation does not displace a live one. On a 65,536-token pool: a 23.8k-token conversation cleared for a
+34k-token prompt came back in 0.97 s with 23,819 tokens restored (26.4 s re-read without the cache), its 48 greedy
+tokens identical. Saves cost ~0.2 s per 6k tokens and ~0.35 s per 24k. `LLAMA_CACHE_RETURN=0` restores upstream's
+rule; the `prompt_cache` log line gives what was saved and loaded. The production launcher runs `--cache-ram 15360
+--no-cache-idle-slots` and 16 checkpoints per slot (the default 32 reserved 19.6 GB of pinned host memory).
 
 ## 15. Rollback by replay: one state a slot instead of a snapshot a token
 

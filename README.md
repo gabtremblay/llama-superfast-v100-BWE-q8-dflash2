@@ -40,8 +40,9 @@ One line each, against upstream at `403f06f`. The design, the measurements and t
 13. **A shared pool of rollback snapshots**: four slots in the memory of two; now behind `LLAMA_RS_REPLAY=0`. ([§13](CHANGES.md#13-a-shared-pool-of-rollback-snapshots))
 14. **A prompt's cells one run, low in the pool**: cached prefixes move, the idle conversations pack down before one is ever cleared, new conversations take the lowest run. ([§14](CHANGES.md#14-a-prompts-cells-stay-one-run-low-in-the-pool))
 15. **Rollback by replay on its own stream**: one kept state a slot and the accepted tokens replayed under the draft; 1.0 GB back, the pool at 262,144. ([§15](CHANGES.md#15-rollback-by-replay-one-state-a-slot-instead-of-a-snapshot-a-token))
-16. **Vision with the scheduler on**: a loaded projector no longer turns the two-user scheduler off; only a prompt holding media pauses the other slots. ([Vision](#vision))
-17. **Two or more cards by code reading**: every addition adapted to upstream's tensor-parallel path, untested here. ([below](#two-or-four-cards-tensor-parallel-untested))
+16. **The prompt cache gives back what left**: a conversation cleared for a bigger prompt is restored from host RAM when it returns, 0.97 s instead of a re-read of 26 s for 24k tokens. ([§16](CHANGES.md#16-the-prompt-cache-gives-back-the-conversations-that-left-the-slots))
+17. **Vision with the scheduler on**: a loaded projector no longer turns the two-user scheduler off; only a prompt holding media pauses the other slots. ([Vision](#vision))
+18. **Two or more cards by code reading**: every addition adapted to upstream's tensor-parallel path, untested here. ([below](#two-or-four-cards-tensor-parallel-untested))
 
 ## Results
 
