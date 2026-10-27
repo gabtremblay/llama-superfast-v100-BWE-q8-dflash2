@@ -38,7 +38,7 @@ One line each, against upstream at `403f06f`. The design, the measurements and t
 11. **Compaction of a boxed-in prefix**: up to 1,024 of a sequence's cells move before a ubatch that cannot grow in place. ([§11](CHANGES.md#11-compaction-of-a-boxed-in-prefix))
 12. **Four slots**: the verify rows budgeted across the generating slots, the draft run one width at a time. ([§12](CHANGES.md#12-four-slots-the-verify-rows-budgeted-the-draft-one-width-at-a-time))
 13. **A shared pool of rollback snapshots**: four slots in the memory of two; now behind `LLAMA_RS_REPLAY=0`. ([§13](CHANGES.md#13-a-shared-pool-of-rollback-snapshots))
-14. **A prompt's cells one run, low in the pool**: cached prefixes move, idle slots are evicted for a longer prompt, new conversations take the lowest run. ([§14](CHANGES.md#14-a-prompts-cells-stay-one-run-low-in-the-pool))
+14. **A prompt's cells one run, low in the pool**: cached prefixes move, the idle conversations pack down before one is ever cleared, new conversations take the lowest run. ([§14](CHANGES.md#14-a-prompts-cells-stay-one-run-low-in-the-pool))
 15. **Rollback by replay on its own stream**: one kept state a slot and the accepted tokens replayed under the draft; 1.0 GB back, the pool at 262,144. ([§15](CHANGES.md#15-rollback-by-replay-one-state-a-slot-instead-of-a-snapshot-a-token))
 16. **Vision with the scheduler on**: a loaded projector no longer turns the two-user scheduler off; only a prompt holding media pauses the other slots. ([Vision](#vision))
 17. **Two or more cards by code reading**: every addition adapted to upstream's tensor-parallel path, untested here. ([below](#two-or-four-cards-tensor-parallel-untested))

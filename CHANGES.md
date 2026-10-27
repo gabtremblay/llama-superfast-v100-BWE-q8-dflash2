@@ -238,6 +238,15 @@ of section 11 skipped those prefixes (its 1,024-cell cap).
   47k-token prompts, four short conversations decoded at 95 tok/s combined instead of 131.
 - BetterBench's prefill sweep on four slots: 12k / 24k / 47k tokens 961 / 915 / 830 tok/s, against 920 / 836 / 716 on
   two slots before; its concurrency sweep 154 tok/s with four requests in flight.
+- Before an idle conversation is cleared, the idle slots' cells and the prompt's own move down over the free cells
+  below them (`llama_kv_pack_seqs`: the idle ones first, the prompt's on top, a device copy of the rows in ranges), so
+  the free space is one run right after the slot that asked, and a conversation is cleared only when the pool is
+  short, not fragmented. Four agents on the 262,144-token pool had cleared 37-52k-token conversations for follow-ups
+  of 29-254 tokens, re-read minutes later beside three generating slots (135-427 s each). On a 65,536-token pool with
+  four conversations, two replaced by shorter ones and one growing past the hole after it: without the packing two
+  17.8k-token conversations were cleared and 41.6k tokens re-read (47 s); with it 23,739 cells moved in 24.4 ms and
+  nothing was cleared, the others' follow-ups fully cached, their greedy answers identical to a fresh read.
+  `LLAMA_KV_PACK=0` turns it off; the `kv_pack` log line gives the cells moved, the time and the room gained.
 
 ## 15. Rollback by replay: one state a slot instead of a snapshot a token
 
