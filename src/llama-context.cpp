@@ -2855,7 +2855,16 @@ uint32_t llama_context::kv_pack_seqs(const llama_seq_id * seqs, size_t n) {
     if (kv == nullptr) {
         return 0;
     }
-    return kv->seqs_pack(std::vector<llama_seq_id>(seqs, seqs + n), [this] { synchronize(); });
+    // the device backend for the row copies (one card; a split cache moves its rows device by device, synchronously)
+    ggml_backend_t be = nullptr;
+    for (auto & b : backends) {
+        ggml_backend_dev_t dev = ggml_backend_get_device(b.get());
+        if (dev != nullptr && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+            be = b.get();
+            break;
+        }
+    }
+    return kv->seqs_pack(std::vector<llama_seq_id>(seqs, seqs + n), [this] { synchronize(); }, be);
 }
 
 // [TAG_KV_EVICT_IDLE]

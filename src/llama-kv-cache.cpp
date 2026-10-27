@@ -1653,7 +1653,7 @@ bool llama_kv_cache::seq_compact(llama_seq_id seq_id, uint32_t n_next, const std
 // conversations (a 25k-token prompt with 67k cells free, none of them a run of 41k), and an idle slot's conversation was
 // cleared for it (TAG_KV_EVICT_IDLE): that slot's next prompt re-read 18k tokens beside three generating slots, ~3 minutes.
 // Packing the movable cells down first makes the free space one run for a few ms of row copies
-uint32_t llama_kv_cache::seqs_pack(const std::vector<llama_seq_id> & seqs, const std::function<void()> & sync) {
+uint32_t llama_kv_cache::seqs_pack(const std::vector<llama_seq_id> & seqs, const std::function<void()> & sync, ggml_backend_t backend) {
     if (!kv_window || n_stream != 1 || v_trans || seqs.empty()) {
         return 0;
     }
@@ -1706,9 +1706,11 @@ uint32_t llama_kv_cache::seqs_pack(const std::vector<llama_seq_id> & seqs, const
     }
 
     // no decode may be reading or writing the cache while its rows move. A range moves down in chunks no longer than its
-    // distance, so a chunk's source and destination never overlap
+    // distance, so a chunk's source and destination never overlap; the chunks go to the backend's stream in order and the
+    // stream is synchronized once at the end (ggml_backend_tensor_copy synchronizes after each copy: 23.7k cells moved by
+    // 2,048 took 1.5 s that way, 24 ms moved in one piece)
     sync();
-    auto move_rows = [&](ggml_tensor * t) {
+    auto move_rows = [&](ggml_tensor * t, ggml_backend_t be) {
         for (const move_t & m : moves) {
             const uint32_t gap = m.src - m.dst;
             for (uint32_t off = 0; off < m.n; ) {
@@ -1719,7 +1721,11 @@ uint32_t llama_kv_cache::seqs_pack(const std::vector<llama_seq_id> & seqs, const
                 s.view_src = t->view_src ? t->view_src : t;
                 ggml_tensor d = s;
                 d.data     = (char *) t->data + (size_t) (m.dst + off)*t->nb[1];
-                ggml_backend_tensor_copy(&s, &d);
+                if (be != nullptr) {
+                    ggml_backend_tensor_copy_async(be, be, &s, &d);
+                } else {
+                    ggml_backend_tensor_copy(&s, &d);
+                }
                 off += n;
             }
         }
@@ -1732,7 +1738,7 @@ uint32_t llama_kv_cache::seqs_pack(const std::vector<llama_seq_id> & seqs, const
             // [TAG_KV_TP] a split stream's rows move on each device's own tensor (seq_compact)
             const size_t n_dev = ggml_backend_meta_buffer_n_simple(t->buffer);
             if (n_dev == 0) {
-                move_rows(t);
+                move_rows(t, backend);
                 continue;
             }
             ggml_tensor * base = t->view_src ? t->view_src : t;
@@ -1743,9 +1749,12 @@ uint32_t llama_kv_cache::seqs_pack(const std::vector<llama_seq_id> & seqs, const
                     td = ggml_backend_meta_tensor_simple(base, dev);
                 }
                 GGML_ASSERT(td != nullptr && td->ne[1] == t->ne[1] && "a split stream's per-device rows");
-                move_rows(td);
+                move_rows(td, nullptr);
             }
         }
+    }
+    if (backend != nullptr) {
+        ggml_backend_synchronize(backend);
     }
     // the cell table follows, in the order of the moves (a destination is empty, or was vacated by an earlier move)
     uint32_t n_moved = 0;
