@@ -2321,8 +2321,10 @@ private:
                 // it lands in one run. With no room the restore is skipped and the entry stays: the request then goes through
                 // the admission check (TAG_KV_ADMIT) like any prompt. A 94k-token conversation's restore failed for want of
                 // 94k free cells and it was re-read beside three other reads
+                // LLAMA_CACHE_ROOM=0: the restore as before, without making room
+                static const bool cache_room = [] { const char * e = getenv("LLAMA_CACHE_ROOM"); return e ? atoi(e) != 0 : true; }();
                 bool restore = true;
-                if (params_base.kv_unified) {
+                if (params_base.kv_unified && cache_room) {
                     const size_t n_entry = prompt_cache->restore_n_tokens(ret->prompt, task.tokens);
                     uint32_t     n_free  = llama_kv_n_free(ctx_tgt);
                     if (n_entry > 0 && n_free != UINT32_MAX) {
