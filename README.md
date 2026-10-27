@@ -32,7 +32,7 @@ Against upstream at `403f06f`, one line each. The design, the measurements and t
 - **Rollback by replay on its own stream**: one kept recurrent state a slot and the draft's accepted tokens replayed under the draft, 1.0 GB back; the earlier shared snapshot pool stays behind `LLAMA_RS_REPLAY=0`. ([§15](CHANGES.md#15-rollback-by-replay-one-state-a-slot-instead-of-a-snapshot-a-token), [§13](CHANGES.md#13-a-shared-pool-of-rollback-snapshots))
 - **A capped CUDA graph cache**: 48 graphs for 120 s instead of 512 for 600 s, ~1.2 GB of VRAM that only grew under real traffic. ([§5](CHANGES.md#5-a-smaller-cuda-graph-cache))
 - **A conversation's cells stay one run of the pool**: placement right after its last cell or in the lowest free run, a boxed-in prefix moved before its ubatch, new conversations low in the pool. ([§6](CHANGES.md#6-cell-placement-in-a-unified-cache), [§11](CHANGES.md#11-compaction-of-a-boxed-in-prefix), [§14](CHANGES.md#14-a-prompts-cells-stay-one-run-low-in-the-pool))
-- **Nothing is cleared for a fragmented pool**: the idle conversations pack down (23.8k cells in 16 ms) before one is ever cleared for a prompt, and a conversation that is cleared comes back from host RAM in under a second instead of a re-read of minutes. ([§14](CHANGES.md#14-a-prompts-cells-stay-one-run-low-in-the-pool), [§16](CHANGES.md#16-the-prompt-cache-gives-back-the-conversations-that-left-the-slots))
+- **Nothing is cleared for a fragmented pool**: the idle conversations pack down (23.8k cells in 16 ms) before one is ever cleared for a prompt, and a conversation that is cleared comes back from host RAM in under a second instead of a re-read of minutes, while the cache keeps 4 GiB of the host's memory free. ([§14](CHANGES.md#14-a-prompts-cells-stay-one-run-low-in-the-pool), [§16](CHANGES.md#16-the-prompt-cache-gives-back-the-conversations-that-left-the-slots))
 
 **Speed**
 
@@ -54,10 +54,11 @@ Against upstream at `403f06f`, one line each. The design, the measurements and t
 
 ## Results
 
-One V100 PCIe 32 GB, Qwen3.8-27B `UD-Q4_K_XL`, DFlash2 draft, `--cache-ram 0`, the same probes for both.
-Upstream is [bitexploder/llama-superfast-v100](https://github.com/bitexploder/llama-superfast-v100) at `403f06f` with its
-f16 KV cache and its recipe (`-b 4096 -ub 2048`), at the largest two-slot context it fits with the DFlash2 draft. This
-fork runs the [Run](#run) line below.
+One V100 PCIe 32 GB, Qwen3.8-27B `UD-Q4_K_XL`, DFlash2 draft, the same probes for both. Upstream is
+[bitexploder/llama-superfast-v100](https://github.com/bitexploder/llama-superfast-v100) at `403f06f` with its f16 KV
+cache and its recipe (`-b 4096 -ub 2048`), at the largest two-slot context it fits with the DFlash2 draft. This fork
+is the rsK build (the replay on its own stream) with `--cache-ram 0`; [the current build](#the-current-build) below
+changes what happens between conversations, not these numbers.
 
 | | Upstream, f16 KV | This fork, `q8_0` KV |
 |---|---|---|
@@ -75,10 +76,10 @@ Upstream's two-user scheduler refuses DFlash2 prompt jobs, so there a side reque
 finishes generating. Here it starts at once and the generating slot keeps ~34 tok/s while it is read ([section 8](CHANGES.md#8-the-two-user-scheduler-with-dflash2-on-a-unified-cache)).
 
 The same comparison under [BetterBench](https://github.com/bitexploder/betterbench) (20 passes per category, a 47k-token
-conversation resident in one slot, the same corpus and sampling for both). Upstream runs with its scheduler off
+conversation resident in one slot, the same corpus and sampling for both, temperature 0.7). Upstream runs with its scheduler off
 (`LLAMA_TU=0`: on, its prompt jobs refuse the DFlash2 draft and long prompts fail) at 2 × 49,152 tokens, the largest
 two-slot context that survived the run: at its 2 × 65,536 the card ran out of memory four minutes in, as its graph
-cache grew under traffic ([section 5](CHANGES.md#5-a-smaller-cuda-graph-cache)). This fork runs the [Run](#run) line: four slots, one 262,144-token pool.
+cache grew under traffic ([section 5](CHANGES.md#5-a-smaller-cuda-graph-cache)). This fork runs four slots on one 262,144-token pool, rsK with `--cache-ram 0`.
 
 | BetterBench | Upstream, f16 KV, 2 × 49,152 | This fork, `q8_0` KV, 4 slots on 262,144 |
 |---|---|---|
@@ -94,6 +95,29 @@ and costs it under 1%). Everything else is ahead: the first token three times so
 four or eight requests in flight 1.75× the throughput, while the fourth request starts in 0.4 s instead of 12 s and the
 eighth in 9 s instead of 33 s (upstream's two slots serve eight requests four at a time). The 262,144-token pool peaks
 at ~32.0 GB of the card's 32.5 over the run.
+
+### The current build
+
+Since rsK the build gives a generating slot more rounds beside a deep prompt read ([section 8](CHANGES.md#8-the-two-user-scheduler-with-dflash2-on-a-unified-cache)),
+packs the pool's idle conversations before clearing one ([section 14](CHANGES.md#14-a-prompts-cells-stay-one-run-low-in-the-pool)), and keeps the
+conversations that leave the slots in a host prompt cache that gives them back when they return
+([section 16](CHANGES.md#16-the-prompt-cache-gives-back-the-conversations-that-left-the-slots)); the [Run](#run) line turns that cache on. Both builds
+back to back on the same card under BetterBench at the server's own temperature, 1.0 (levels 1 / 2 / 4):
+
+| BetterBench, temperature 1.0 | rsK, `--cache-ram 0` | Current, the Run line (cache 15 GiB) |
+|---|---|---|
+| Time to first token, single stream (p50) | 185 ms | 186 ms |
+| Single-stream decode, median of 160 runs | 111.6 tok/s | 107.5 tok/s |
+| Verify step, server side | 41.6 ms | 41.6 ms |
+| Cold prefill, 12k / 24k / 47k-token prompts | 965 / 917 / 832 tok/s | 937 / 897 / 816 tok/s |
+| Aggregate decode, 1 / 2 / 4 requests in flight | 91 / 108 / 156 tok/s | 90 / 108 / 156 tok/s |
+| Peak VRAM / lowest host memory available | 31,934 MiB / 7.6 GB | 32,116 MiB / 4.4 GB |
+
+Decode and the first token are unchanged: the lower decode median is the draft's acceptance at temperature 1.0 (0.412
+against 0.425 in this run), the verify step is the same. What the cache costs is its save when a conversation leaves
+its slot, ~0.64 s for 47k tokens: the bench sees it as prefill 2–3% slower from 12k tokens up, since each of its
+prompts displaces the previous one, and as four first tokens near 1 s. What it gives, a returning conversation back in
+under a second instead of a re-read of minutes, never shows here: the bench's conversations do not return.
 
 ## Build
 
@@ -147,13 +171,13 @@ repository.
 One card, four slots, DFlash2, one 262,144-token pool:
 
 ```bash
-LLAMA_DFLASH2_HEAD_FILE=models/mtp-Qwen3.8-27B-Q4_0.gguf LLAMA_SPEC_DRAFT_VOCAB_FILE=models/draft-vocab-qwen3.8-27b.txt build/bin/llama-server -m models/Qwen3.8-27B-UD-Q4_K_XL.gguf -md models/Qwen3.8-27B-DFlash2-Q4_K_M.gguf --spec-type draft-dflash --spec-draft-n-max 7 --spec-draft-ubatch 512 -c 262144 --parallel 4 --kv-unified -fa on -ngl 99 -ctk q8_0 -ctv q8_0 -ctkd f16 -ctvd f16 -t 12 -b 2048 -ub 2048 --cache-ram 0 --jinja --metrics --temp 1.0 --top-p 0.95 --top-k 20 --host 127.0.0.1 --port 8080
+LLAMA_DFLASH2_HEAD_FILE=models/mtp-Qwen3.8-27B-Q4_0.gguf LLAMA_SPEC_DRAFT_VOCAB_FILE=models/draft-vocab-qwen3.8-27b.txt build/bin/llama-server -m models/Qwen3.8-27B-UD-Q4_K_XL.gguf -md models/Qwen3.8-27B-DFlash2-Q4_K_M.gguf --spec-type draft-dflash --spec-draft-n-max 7 --spec-draft-ubatch 512 -c 262144 --parallel 4 --kv-unified -fa on -ngl 99 -ctk q8_0 -ctv q8_0 -ctkd f16 -ctvd f16 -t 12 -b 2048 -ub 2048 --cache-ram 15360 --no-cache-idle-slots --ctx-checkpoints 16 --jinja --metrics --temp 1.0 --top-p 0.95 --top-k 20 --host 127.0.0.1 --port 8080
 ```
 
 The same with the Docker image (models in `$PWD/models`):
 
 ```bash
-docker run -d --name llama-superfast --init --gpus all -p 8080:8080 -v "$PWD/models:/models:ro" -e LLAMA_DFLASH2_HEAD_FILE=/models/mtp-Qwen3.8-27B-Q4_0.gguf llama-superfast-v100 --host 0.0.0.0 --port 8080 -m /models/Qwen3.8-27B-UD-Q4_K_XL.gguf -md /models/Qwen3.8-27B-DFlash2-Q4_K_M.gguf --spec-type draft-dflash --spec-draft-n-max 7 --spec-draft-ubatch 512 -c 262144 --parallel 4 --kv-unified -fa on -ngl 99 -ctk q8_0 -ctv q8_0 -ctkd f16 -ctvd f16 -t 12 -b 2048 -ub 2048 --cache-ram 0 --jinja --metrics --temp 1.0 --top-p 0.95 --top-k 20
+docker run -d --name llama-superfast --init --gpus all -p 8080:8080 -v "$PWD/models:/models:ro" -e LLAMA_DFLASH2_HEAD_FILE=/models/mtp-Qwen3.8-27B-Q4_0.gguf llama-superfast-v100 --host 0.0.0.0 --port 8080 -m /models/Qwen3.8-27B-UD-Q4_K_XL.gguf -md /models/Qwen3.8-27B-DFlash2-Q4_K_M.gguf --spec-type draft-dflash --spec-draft-n-max 7 --spec-draft-ubatch 512 -c 262144 --parallel 4 --kv-unified -fa on -ngl 99 -ctk q8_0 -ctv q8_0 -ctkd f16 -ctvd f16 -t 12 -b 2048 -ub 2048 --cache-ram 15360 --no-cache-idle-slots --ctx-checkpoints 16 --jinja --metrics --temp 1.0 --top-p 0.95 --top-k 20
 ```
 
 What the settings do:
@@ -170,10 +194,19 @@ What the settings do:
   `--no-kv-unified` gives each slot a fixed share (with two slots 2 × 122,880) at the same speed.
 - `-b 2048` equal to `-ub` keeps the DFlash2 features on the GPU during prefill ([section 3](CHANGES.md#3-prompt-work-kept-on-the-gpu)).
 - `--spec-draft-ubatch 512` sizes the draft's compute buffer for 512-token batches, which frees 1.7 GB.
-- `--cache-ram 0` turns off the host prompt cache. Saving a slot's state to host memory costs ~220 ms over a slow link
-  each time a slot switches conversations; with one user and pinned slots (`id_slot` in the request) the cache brings
-  little. On a fast link, try it on.
-- 262,144 tokens with four slots peaks at ~32.0 GB under BetterBench. VRAM keeps growing for the first minutes of real
+- `--cache-ram 15360 --no-cache-idle-slots` ([section 16](CHANGES.md#16-the-prompt-cache-gives-back-the-conversations-that-left-the-slots)): a host prompt cache of
+  15 GiB for the conversations that leave the slots. One cleared from the pool for a bigger prompt, or replaced in its
+  slot, is restored when it comes back: 0.97 s for 24k tokens over this link, against a re-read of 26 s. The save
+  pauses the server once, ~0.64 s for 47k tokens; conversations under 8,192 tokens are not saved
+  (`LLAMA_CACHE_MIN_TOKENS`), and the cache drops its oldest entries to keep 4 GiB of the host's memory available
+  whatever its limit (`LLAMA_CACHE_RESERVE_MIB`). Without `--no-cache-idle-slots` the server saves and clears every
+  idle slot at every new task. `--cache-ram 0` turns the cache off. It is RAM: a restart loses it.
+- `--ctx-checkpoints 16` ([section 10](CHANGES.md#10-checkpoints)): the recurrent-state checkpoints each slot keeps,
+  150 MiB each in pinned host memory reserved at start (16 × 4 slots + 3, 10 GB; the default of 32 reserves 19.6 GB).
+  The latest resumes the next turn; the older ones resume a prompt edited mid-way.
+- Host memory: these settings take ~12.5 GB at start and up to ~28 GB with a full cache, on a 32 GB host. With less,
+  lower `--cache-ram` (or 0) and `--ctx-checkpoints`.
+- 262,144 tokens with four slots peaks at ~32.1 GB under BetterBench. VRAM keeps growing for the first minutes of real
   traffic, so size a different context from a long mixed run, not a fill test ([section 5](CHANGES.md#5-a-smaller-cuda-graph-cache)).
 
 The host side of this setup — powering an OcuLink eGPU dock from a USB relay, training the PCIe link through an S3
@@ -181,8 +214,10 @@ suspend, loading the driver with the 200 W cap, and cooling the passive card wit
 temperature, as systemd units an inference service chains after — is published separately as
 [v100-egpu-host](https://github.com/gabtremblay/v100-egpu-host), with the bill of materials.
 
-Check the startup log for `two-user scheduling (LLAMA_TU): on`, the draft model loading, and
-`n_slots = 4, n_ctx_slot = 262144`. Draft acceptance on this target is ~0.5; near zero means the draft did not load.
+Check the startup log for `two-user scheduling (LLAMA_TU): on`, the draft model loading,
+`prompt checkpoints: 67 pinned buffers` and `n_slots = 4, n_ctx_slot = 262144`. Draft acceptance on this target is
+~0.4–0.5; near zero means the draft did not load. In traffic, `kv_pack` lines mean the pool was packed instead of a
+conversation cleared, and `prompt_cache: ... loaded=1` a conversation restored from the cache.
 
 For MTP instead of DFlash2: `-md models/mtp-Qwen3.8-27B-Q4_0.gguf --spec-type draft-mtp`, without
 `LLAMA_DFLASH2_HEAD_FILE` or `--spec-draft-ubatch`. It decodes slower here.
@@ -203,14 +238,18 @@ run it on. What was done, and what to expect:
   `LLAMA_DFLASH2_FEAT_DEV=0` then.
 - **The two-user scheduler** runs its prompt jobs on the plain layer loop under the split (upstream's interleaved
   two-half prefill is off while the draft reads layer inputs, as upstream decided), with MTP or DFlash2.
-- **The shared snapshot pool** restores and backs up its rows per card; the fused write is a per-card kernel already.
+- **The rollback's replay** and, behind `LLAMA_RS_REPLAY=0`, **the shared snapshot pool** restore and back up their
+  rows per card; the fused write is a per-card kernel already.
+- **The pool's packing** moves a split cache's rows device by device, with a synchronous copy each (slower than on one
+  card).
 - **Checkpoints** on a split cache go through upstream's path; the fork's staged copy (`LLAMA_CKPT_STAGE`) steps aside
   for them.
 
-The line is upstream's two-card line with this fork's switches, for example on two cards:
+The line is upstream's two-card line with this fork's switches, for example on two cards. It leaves the prompt cache
+off (`--cache-ram 0`): its save and restore on a split cache are untested.
 
 ```bash
-CUDA_VISIBLE_DEVICES=0,1 GGML_CUDA_P2P=1 LLAMA_RS_POOL=12 LLAMA_DFLASH2_HEAD_FILE=models/mtp-Qwen3.8-27B-Q4_0.gguf LLAMA_SPEC_DRAFT_VOCAB_FILE=models/draft-vocab-qwen3.8-27b.txt build/bin/llama-server -m models/Qwen3.8-27B-UD-Q4_K_XL.gguf -md models/Qwen3.8-27B-DFlash2-Q4_K_M.gguf --spec-type draft-dflash --spec-draft-n-max 7 --spec-draft-ubatch 512 -c 491520 --parallel 4 --kv-unified --split-mode tensor -fa on -ngl 99 -ctk q8_0 -ctv q8_0 -ctkd f16 -ctvd f16 -t 12 -b 2048 -ub 2048 --cache-ram 0 --jinja --metrics --temp 1.0 --top-p 0.95 --top-k 20 --host 127.0.0.1 --port 8080
+CUDA_VISIBLE_DEVICES=0,1 GGML_CUDA_P2P=1 LLAMA_DFLASH2_HEAD_FILE=models/mtp-Qwen3.8-27B-Q4_0.gguf LLAMA_SPEC_DRAFT_VOCAB_FILE=models/draft-vocab-qwen3.8-27b.txt build/bin/llama-server -m models/Qwen3.8-27B-UD-Q4_K_XL.gguf -md models/Qwen3.8-27B-DFlash2-Q4_K_M.gguf --spec-type draft-dflash --spec-draft-n-max 7 --spec-draft-ubatch 512 -c 491520 --parallel 4 --kv-unified --split-mode tensor -fa on -ngl 99 -ctk q8_0 -ctv q8_0 -ctkd f16 -ctvd f16 -t 12 -b 2048 -ub 2048 --cache-ram 0 --jinja --metrics --temp 1.0 --top-p 0.95 --top-k 20 --host 127.0.0.1 --port 8080
 ```
 
 Two 32 GB cards hold about twice the pool (the weights are split too), so `-c` can double; start lower and raise it
@@ -223,15 +262,15 @@ with `CUDA_VISIBLE_DEVICES=0` is the fallback, and a report with the server log 
 The server takes images when Qwen3.8-27B's vision projector is loaded: `--mmproj models/mmproj-F16.gguf`
 (from the same Unsloth repository, 884 MiB; a BF16 one is there too, and any Qwen3.8-27B projector fits, a Q8_0 one
 saving ~440 MiB). Chat requests then carry `image_url` parts (data: URLs or http). The projector and its encode buffers
-need room the 245,760-token pool does not have, so the pool gives up 49,152 tokens:
+take ~2 GB of the card, so the pool is 196,608 tokens instead of 262,144:
 
 ```bash
-LLAMA_RS_POOL=12 LLAMA_DFLASH2_HEAD_FILE=models/mtp-Qwen3.8-27B-Q4_0.gguf LLAMA_SPEC_DRAFT_VOCAB_FILE=models/draft-vocab-qwen3.8-27b.txt build/bin/llama-server -m models/Qwen3.8-27B-UD-Q4_K_XL.gguf --mmproj models/mmproj-F16.gguf -md models/Qwen3.8-27B-DFlash2-Q4_K_M.gguf --spec-type draft-dflash --spec-draft-n-max 7 --spec-draft-ubatch 512 -c 196608 --parallel 4 --kv-unified -fa on -ngl 99 -ctk q8_0 -ctv q8_0 -ctkd f16 -ctvd f16 -t 12 -b 2048 -ub 2048 --cache-ram 0 --jinja --metrics --temp 1.0 --top-p 0.95 --top-k 20 --host 127.0.0.1 --port 8080
+LLAMA_DFLASH2_HEAD_FILE=models/mtp-Qwen3.8-27B-Q4_0.gguf LLAMA_SPEC_DRAFT_VOCAB_FILE=models/draft-vocab-qwen3.8-27b.txt build/bin/llama-server -m models/Qwen3.8-27B-UD-Q4_K_XL.gguf --mmproj models/mmproj-F16.gguf -md models/Qwen3.8-27B-DFlash2-Q4_K_M.gguf --spec-type draft-dflash --spec-draft-n-max 7 --spec-draft-ubatch 512 -c 196608 --parallel 4 --kv-unified -fa on -ngl 99 -ctk q8_0 -ctv q8_0 -ctkd f16 -ctvd f16 -t 12 -b 2048 -ub 2048 --cache-ram 15360 --no-cache-idle-slots --ctx-checkpoints 16 --jinja --metrics --temp 1.0 --top-p 0.95 --top-k 20 --host 127.0.0.1 --port 8080
 ```
 
 (the Docker line takes the same two additions: `--mmproj /models/mmproj-F16.gguf` and `-c 196608`).
 
-What was measured (four slots, `LLAMA_RS_POOL=12`, `--cache-ram 0`):
+What was measured, on the build before the replay (four slots, the shared snapshot pool, `--cache-ram 0`):
 
 - 196,608 tokens is the largest pool that keeps a margin: 29.6 GB after load, 31.6 GB peak over 50 minutes of concurrent
   image and text requests, 47k-token prompts and four-slot decode, against the card's 32.5 GB; the text-only pool of
@@ -246,6 +285,8 @@ What was measured (four slots, `LLAMA_RS_POOL=12`, `--cache-ram 0`):
   requests in flight fell to 71 tok/s combined.
 - With a projector loaded, llama.cpp's prompt cache reuse and context shift are off for every slot (upstream's rule), and
   so is the fork's tail-snapshot checkpoint for prompts that hold media.
+- Not measured since: the replay freed 1.0 GB of the card, so a pool larger than 196,608 may fit with the projector,
+  and the host prompt cache in the line above has not run with images.
 
 ## Known limits
 
@@ -253,9 +294,15 @@ What was measured (four slots, `LLAMA_RS_POOL=12`, `--cache-ram 0`):
   only.
 - Combined decode tops out near 130–160 tok/s with four slots: a verify step costs about the same up to 8 rows, so the
   slots share 16 verify rows a step ([section 12](CHANGES.md#12-four-slots-the-verify-rows-budgeted-the-draft-one-width-at-a-time)), and each slot drafts less when more generate.
-- Four slots at 262,144 tokens (the model's training context) use ~32.0 GB of the card's 32.5 under BetterBench. The
+- Four slots at 262,144 tokens (the model's training context) use ~32.1 GB of the card's 32.5 under BetterBench. The
   recurrent rows are 150 MiB each ([sections 13](CHANGES.md#13-a-shared-pool-of-rollback-snapshots) and [15](CHANGES.md#15-rollback-by-replay-one-state-a-slot-instead-of-a-snapshot-a-token)), 10 of them with the replay.
 - The first two prompts after a start pay ~0.4 s once each to allocate a device checkpoint copy.
+- The checkpoint pool and the prompt cache live in host memory: ~10 GB pinned and up to 15 GiB with the Run line, on a
+  32 GB host. A restart loses every cached conversation, so the next prompt of a long conversation is read in full (a
+  190k-token conversation took 6 minutes).
+- The cache's save copies a conversation that leaves its slot while every slot waits, ~0.64 s for 47k tokens.
+- A prompt is admitted when a slot is free, not when the pool can hold it: one that cannot fit beside the others (126k
+  tokens beside a 188k-token conversation) is read until the pool runs out, then fails.
 - Two or more cards (`--split-mode tensor`) are supported by code reading only (the section after `## Run`): nothing
   here has run on more than one card.
 
