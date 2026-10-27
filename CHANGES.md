@@ -262,8 +262,19 @@ it), whether or not a peer is busy; nothing is saved or cleared otherwise. The L
 returning conversation does not displace a live one. On a 65,536-token pool: a 23.8k-token conversation cleared for a
 34k-token prompt came back in 0.97 s with 23,819 tokens restored (26.4 s re-read without the cache), its 48 greedy
 tokens identical. Saves cost ~0.2 s per 6k tokens and ~0.35 s per 24k. `LLAMA_CACHE_RETURN=0` restores upstream's
-rule; the `prompt_cache` log line gives what was saved and loaded. The production launcher runs `--cache-ram 15360
---no-cache-idle-slots` and 16 checkpoints per slot (the default 32 reserved 19.6 GB of pinned host memory).
+rule; the `prompt_cache` log line gives what was saved and loaded.
+
+The cache must not take the host down. Its limit counts its state vectors and checkpoints, but its entries take
+checkpoint blocks from the pinned reserve, the slots' next checkpoints then take fresh anonymous memory, and a recycle
+pool keeps more: with `--cache-ram 15360` beside the 10.5 GB reserve the server held 17.5 GB of anonymous memory for
+a 13.9 GB cache, and under BetterBench the host ran out (OOM-killed in production; on the dev build a watchdog stopped
+it at 1.5 GB available, 16 requests into the concurrency sweep). A new entry now also needs the host's `MemAvailable`
+to stay above `LLAMA_CACHE_RESERVE_MIB` (default 4096) after it: the oldest entries go first, and the save is skipped
+when none are left. A conversation shorter than `LLAMA_CACHE_MIN_TOKENS` (default 8192) is not saved: every
+single-stream request of the bench paid ~150 ms to first token saving the previous one-off conversation (its
+recurrent state and tail checkpoint, ~300 MiB over the link; 248 ms for a 612-token one), and it never came back.
+The production launcher runs `--cache-ram 15360 --no-cache-idle-slots` and 16 checkpoints per slot (the default 32
+reserved 19.6 GB of pinned host memory).
 
 ## 15. Rollback by replay: one state a slot instead of a snapshot a token
 
