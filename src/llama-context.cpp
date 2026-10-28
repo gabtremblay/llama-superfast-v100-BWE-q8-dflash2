@@ -17,7 +17,13 @@
 #include "llama.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cinttypes>
+#include <condition_variable>
+#include <deque>
+#include <map>
+#include <mutex>
+#include <thread>
 #include <cmath>
 #include <cstring>
 #include <limits>
@@ -27,6 +33,215 @@
 //
 // llama_context
 //
+
+// [TAG_CACHE_BG_SAVE] a sequence's state saved to host memory without stopping the device. A conversation leaving its slot
+// for the prompt cache held every slot while its rows crossed the link: a stop of the device, then one blocking copy per
+// layer and cell range into pageable memory (61k tokens: 2.83 s in production, every slot waiting). The worker thread below
+// does the copies on a stream of its own, after an event the caller's thread recorded on the compute stream: per chunk of
+// at most CHUNK bytes, one launch gathers the chunk's ranges into a device staging half, one copy sends it to a pinned
+// host half, and the thread copies it into the destination while the other half's chunk crosses the link. The device
+// holds 2 x CHUNK of staging, not the state's size
+struct llama_bg_saver {
+    static constexpr size_t CHUNK = 32ull << 20; // 2 x 32 MiB of the card's memory: the 27B's pool leaves ~0.3 GB
+
+    struct job {
+        int32_t                              ticket;
+        std::vector<llama_state_write_info>  writes;
+        ggml_backend_event_t                 ev_main; // the compute stream's work queued before the save
+        int64_t                              t0;
+    };
+
+    ggml_backend_t        be       = nullptr; // its own stream on the device
+    ggml_backend_buffer_t dev_buf  = nullptr; // 2 x CHUNK of staging
+    ggml_backend_buffer_t host_buf = nullptr; // 2 x CHUNK pinned
+    ggml_backend_event_t  ev[2]    = {};
+    void *                gather   = nullptr; // ggml_backend_cuda_gather_bytes
+
+    std::thread             worker;
+    std::mutex              mtx;
+    std::condition_variable cv;
+    std::condition_variable cv_done;
+    std::deque<job>         queue;
+    std::map<int32_t, int>  status; // 0 copying, 1 done, -1 failed
+    int32_t                 next_ticket = 1;
+    bool                    stop        = false;
+
+    bool init(ggml_backend_dev_t dev) {
+        gather = ggml_backend_reg_get_proc_address(ggml_backend_dev_backend_reg(dev), "ggml_backend_cuda_gather_bytes");
+        be     = gather ? ggml_backend_dev_init(dev, nullptr) : nullptr;
+        if (be == nullptr) {
+            return false;
+        }
+        ggml_backend_buffer_type_t host_buft = ggml_backend_dev_host_buffer_type(dev);
+        dev_buf  = ggml_backend_buft_alloc_buffer(ggml_backend_get_default_buffer_type(be), 2*CHUNK);
+        host_buf = host_buft ? ggml_backend_buft_alloc_buffer(host_buft, 2*CHUNK) : nullptr;
+        ev[0]    = ggml_backend_event_new(dev);
+        ev[1]    = ggml_backend_event_new(dev);
+        if (dev_buf == nullptr || host_buf == nullptr || ev[0] == nullptr || ev[1] == nullptr) {
+            return false;
+        }
+        worker = std::thread([this] { run(); });
+        return true;
+    }
+
+    ~llama_bg_saver() {
+        {
+            std::lock_guard<std::mutex> lock(mtx);
+            stop = true;
+        }
+        cv.notify_all();
+        if (worker.joinable()) {
+            worker.join(); // finishes the queued jobs first
+        }
+        for (auto * e : ev) {
+            if (e) {
+                ggml_backend_event_free(e);
+            }
+        }
+        if (host_buf) {
+            ggml_backend_buffer_free(host_buf);
+        }
+        if (dev_buf) {
+            ggml_backend_buffer_free(dev_buf);
+        }
+        if (be) {
+            ggml_backend_free(be);
+        }
+    }
+
+    int32_t submit(job && j) {
+        int32_t t;
+        {
+            std::lock_guard<std::mutex> lock(mtx);
+            t = j.ticket = next_ticket++;
+            status[t] = 0;
+            queue.push_back(std::move(j));
+        }
+        cv.notify_all();
+        return t;
+    }
+
+    // returns once the ticket's copy is done (or the ticket is unknown)
+    void wait(int32_t ticket) {
+        std::unique_lock<std::mutex> lock(mtx);
+        cv_done.wait(lock, [&] { auto it = status.find(ticket); return it == status.end() || it->second != 0; });
+    }
+
+    int32_t poll(int32_t ticket) {
+        std::lock_guard<std::mutex> lock(mtx);
+        auto it = status.find(ticket);
+        if (it == status.end()) {
+            return -1;
+        }
+        const int r = it->second;
+        if (r != 0) {
+            status.erase(it);
+        }
+        return r;
+    }
+
+    void run() {
+        for (;;) {
+            job j;
+            {
+                std::unique_lock<std::mutex> lock(mtx);
+                cv.wait(lock, [this] { return stop || !queue.empty(); });
+                if (queue.empty()) {
+                    return; // stop, nothing left
+                }
+                j = std::move(queue.front());
+                queue.pop_front();
+            }
+            size_t bytes = 0;
+            const bool ok = copy(j, bytes);
+            if (j.ev_main) {
+                ggml_backend_event_free(j.ev_main);
+            }
+            const double ms = (ggml_time_us() - j.t0)/1000.0;
+            LLAMA_LOG_WARN("%s: state of ticket %d, %.1f MiB in %zu ranges: %s in %.1f ms (%.2f GB/s)\n", __func__, j.ticket,
+                    bytes/1048576.0, j.writes.size(), ok ? "copied" : "FAILED", ms, ms > 0 ? bytes/ms/1e6 : 0.0);
+            {
+                std::lock_guard<std::mutex> lock(mtx);
+                status[j.ticket] = ok ? 1 : -1;
+            }
+            cv_done.notify_all();
+        }
+    }
+
+    // a view of n bytes at data in buf, for the backend's async get
+    static ggml_tensor bytes_view(ggml_backend_buffer_t buf, void * data, size_t n) {
+        ggml_tensor t = {};
+        t.type   = GGML_TYPE_I8;
+        t.buffer = buf;
+        t.data   = data;
+        t.ne[0] = (int64_t) n; t.ne[1] = t.ne[2] = t.ne[3] = 1;
+        t.nb[0] = 1; t.nb[1] = n; t.nb[2] = n; t.nb[3] = n;
+        return t;
+    }
+
+    bool copy(const job & j, size_t & bytes) {
+        typedef bool (*gather_fn_t)(ggml_backend_t, const uint64_t *, int, void *);
+        // the pieces: each write, split at CHUNK
+        struct piece { uint64_t src; uint8_t * dst; uint64_t n; };
+        std::vector<piece> pieces;
+        for (const auto & w : j.writes) {
+            const uint64_t src = (uint64_t) (uintptr_t) ((const char *) w.tensor->data + w.offset);
+            for (uint64_t off = 0; off < w.size; off += CHUNK) {
+                pieces.push_back({ src + off, w.ptr + off, std::min<uint64_t>(CHUNK, w.size - off) });
+            }
+            bytes += w.size;
+        }
+        // the chunks: consecutive pieces at 16-byte offsets, at most CHUNK bytes
+        struct chunk { size_t first, last; size_t n_bytes; std::vector<uint64_t> ranges; };
+        std::vector<chunk> chunks;
+        for (size_t i = 0; i < pieces.size(); ++i) {
+            const uint64_t at = chunks.empty() ? CHUNK : GGML_PAD(chunks.back().n_bytes, 16);
+            if (chunks.empty() || at + pieces[i].n > CHUNK) {
+                chunks.push_back({ i, i, 0, {} });
+            }
+            chunk & c = chunks.back();
+            const uint64_t off = GGML_PAD(c.n_bytes, 16);
+            c.ranges.insert(c.ranges.end(), { pieces[i].src, off, pieces[i].n });
+            c.n_bytes = off + pieces[i].n;
+            c.last    = i;
+        }
+        if (chunks.empty()) {
+            return true;
+        }
+        char * dbase = (char *) ggml_backend_buffer_get_base(dev_buf);
+        char * hbase = (char *) ggml_backend_buffer_get_base(host_buf);
+        ggml_backend_event_wait(be, j.ev_main);
+        auto enqueue = [&](size_t k) {
+            const int b = (int) (k % 2);
+            const chunk & c = chunks[k];
+            if (!((gather_fn_t) gather)(be, c.ranges.data(), (int) (c.ranges.size()/3), dbase + b*CHUNK)) {
+                return false;
+            }
+            ggml_tensor v = bytes_view(dev_buf, dbase + b*CHUNK, c.n_bytes);
+            ggml_backend_tensor_get_async(be, &v, hbase + b*CHUNK, 0, c.n_bytes);
+            ggml_backend_event_record(ev[b], be);
+            return true;
+        };
+        bool ok = enqueue(0) && (chunks.size() < 2 || enqueue(1));
+        for (size_t k = 0; ok && k < chunks.size(); ++k) {
+            const int b = (int) (k % 2);
+            ggml_backend_event_synchronize(ev[b]);
+            const chunk & c = chunks[k];
+            for (size_t i = c.first, r = 0; i <= c.last; ++i, ++r) {
+                memcpy(pieces[i].dst, hbase + b*CHUNK + c.ranges[3*r + 1], pieces[i].n);
+            }
+            if (k + 2 < chunks.size()) {
+                ok = enqueue(k + 2);
+            }
+        }
+        ggml_backend_synchronize(be);
+        return ok;
+    }
+};
+
+// [TAG_CACHE_BG_SAVE] one saver a device, shared by the contexts on it (2 x CHUNK of the card's memory once, not per context)
+static std::mutex                                                          g_bg_mtx;
+static std::map<ggml_backend_dev_t, std::weak_ptr<llama_bg_saver>>         g_bg_savers;
 
 static llm_graph_type ctx_type_to_graph_type(llama_context_type ctx_type) {
     switch (ctx_type) {
@@ -569,6 +784,15 @@ llama_context::~llama_context() {
     // wait for any pending asynchronous copies into the output buffers before they are freed
     pipe_drain();
     synchronize();
+
+    // [TAG_CACHE_BG_SAVE] this context's background saves finish before the backends and buffers they read go away
+    if (bg_saver) {
+        for (int32_t t : bg_tickets) {
+            bg_saver->wait(t);
+        }
+        bg_tickets.clear();
+        bg_saver.reset();
+    }
 
     // the second scheduler's rounds over the context's life, decodes with no job active included
     if (tu_peer_total.n > 0) {
@@ -5692,6 +5916,82 @@ bool llama_context::state_stage_writes(const std::vector<llama_state_write_info>
     return true;
 }
 
+// [TAG_CACHE_BG_SAVE] see llama_bg_saver. LLAMA_CACHE_BG_SAVE=0: never (the caller saves synchronously)
+int32_t llama_context::state_seq_get_data_bg(llama_seq_id seq_id, uint8_t * dst, size_t size) {
+    static const bool on = [] { const char * e = getenv("LLAMA_CACHE_BG_SAVE"); return e == nullptr || atoi(e) != 0; }();
+    ggml_backend_t main_be = kv_move_backend();
+    if (!on || bg_off || main_be == nullptr || dst == nullptr) {
+        return 0;
+    }
+    ggml_backend_dev_t dev = ggml_backend_get_device(main_be);
+    if (!bg_saver) {
+        std::lock_guard<std::mutex> lock(g_bg_mtx);
+        bg_saver = g_bg_savers[dev].lock();
+        if (!bg_saver) {
+            auto s = std::make_shared<llama_bg_saver>();
+            if (!s->init(dev)) {
+                LLAMA_LOG_WARN("%s: background state saves unavailable on %s, saves stop the device\n", __func__, ggml_backend_dev_name(dev));
+                bg_off = true;
+                return 0;
+            }
+            LLAMA_LOG_WARN("%s: background state saves on %s: 2 x %zu MiB of staging and of pinned host memory (LLAMA_CACHE_BG_SAVE=0: off)\n",
+                    __func__, ggml_backend_dev_name(dev), llama_bg_saver::CHUNK >> 20);
+            g_bg_savers[dev] = s;
+            bg_saver = s;
+        }
+    }
+
+    // the header and the metadata now; the tensor writes are recorded, not done
+    std::vector<ggml_backend_t> cands = { main_be };
+    std::vector<ggml_backend_t> used;
+    std::vector<llama_state_write_info> writes;
+    size_t n = 0;
+    {
+        llama_io_write_host_async io(dst, size, cands, used);
+        try {
+            io.write(&io_magic, sizeof(io_magic));
+            io.write(&seq_id, sizeof(seq_id));
+            n = state_seq_write_data(io, seq_id, 0);
+        } catch (const std::exception & err) {
+            LLAMA_LOG_ERROR("%s: error saving state: %s\n", __func__, err.what());
+            n = 0;
+        }
+        writes = io.take_writes();
+    }
+    if (n != size) {
+        return 0;
+    }
+    // every tensor on one plain buffer of this device; a host buffer's bytes are copied now
+    std::vector<llama_state_write_info> dev_writes;
+    for (const auto & w : writes) {
+        ggml_backend_buffer_t buf = w.tensor->view_src ? w.tensor->view_src->buffer : w.tensor->buffer;
+        if (ggml_backend_buffer_is_host(buf)) {
+            ggml_backend_tensor_get(w.tensor, w.ptr, w.offset, w.size);
+            continue;
+        }
+        if (ggml_backend_meta_buffer_n_simple(buf) != 0 || ggml_backend_buft_get_device(ggml_backend_buffer_get_type(buf)) != dev) {
+            return 0;
+        }
+        dev_writes.push_back(w);
+    }
+    ggml_backend_event_t ev_main = ggml_backend_event_new(dev);
+    if (ev_main == nullptr) {
+        return 0;
+    }
+    ggml_backend_event_record(ev_main, main_be);
+    const int32_t ticket = bg_saver->submit({ 0, std::move(dev_writes), ev_main, ggml_time_us() });
+    bg_tickets.push_back(ticket);
+    return ticket;
+}
+
+int32_t llama_context::state_seq_bg_poll(int32_t ticket) {
+    const int32_t r = bg_saver ? bg_saver->poll(ticket) : -1;
+    if (r != 0) {
+        bg_tickets.erase(std::remove(bg_tickets.begin(), bg_tickets.end(), ticket), bg_tickets.end());
+    }
+    return r;
+}
+
 void llama_context::state_seq_wait() {
     if (stage_pending) {
         ggml_backend_event_synchronize(stage_ev_copy);
@@ -7055,6 +7355,14 @@ size_t llama_state_seq_get_data_ext(llama_context * ctx, uint8_t * dst, size_t s
 }
 void llama_state_seq_wait(llama_context * ctx) {
     ctx->state_seq_wait();
+}
+
+int32_t llama_state_seq_get_data_bg(llama_context * ctx, uint8_t * dst, size_t size, llama_seq_id seq_id) {
+    return ctx->state_seq_get_data_bg(seq_id, dst, size);
+}
+
+int32_t llama_state_seq_bg_poll(llama_context * ctx, int32_t ticket) {
+    return ctx->state_seq_bg_poll(ticket);
 }
 
 size_t llama_state_seq_set_data_ext(llama_context * ctx, const uint8_t * src, size_t size, llama_seq_id seq_id, llama_state_seq_flags flags) {

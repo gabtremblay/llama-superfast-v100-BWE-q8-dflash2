@@ -20,6 +20,7 @@
 #include "mtmd-helper.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstddef>
 #include <cmath>
 #include <cinttypes>
@@ -29,6 +30,7 @@
 #include <random>
 #include <utility>
 #include <fstream>
+#include <thread>
 
 // [TAG_SPEC_BLOCK] block verification for this server's target, set once at load: LLAMA_SPEC_BLOCK_VERIFY
 // unset turns it on for the 27B (architecture qwen35) only; Flash-Next and every other target keep the token step until each is
@@ -308,6 +310,21 @@ struct server_slot {
     // the slot needs a context shift while a job lives: it skips the rounds until the job ends
     bool tu_hold = false;
 
+    // [TAG_CACHE_BG_SAVE] the slot's conversation is being copied into a prompt-cache entry in the background
+    // (prompt_save_bg): its cells and rows stay as they are, and the slot takes no task and is not packed or cleared until
+    // prompt_save_poll sees the copy done and clears it
+    bool                        bg_saving = false;
+    int32_t                     bg_ticket = 0;     // the target's copy (0: done)
+    int32_t                     bg_ticket_dft = 0; // the draft's (0: done or saved synchronously)
+    bool                        bg_failed = false;
+    server_prompt_cache_state * bg_entry  = nullptr;
+    int64_t                     bg_t0     = 0;
+
+    // held by a job or by a background save: no task, pack, clearing or restore takes it
+    bool held() const {
+        return tu_owned || bg_saving;
+    }
+
     // the cached prefix a not-started task's start will reuse, computed once per task (tu_remaining)
     int     tu_prefix_id_task = -1;
     int32_t tu_prefix         = 0;
@@ -414,6 +431,134 @@ struct server_slot {
                 prompt.tokens.size(), (t1 - t0) / 1e3, (t2 - t1) / 1e3, cur_size / 1048576.0, (ggml_time_us() - t2) / 1e3,
                 n_moved, cur->prompt.checkpoints.size() - n_moved, n_skipped);
 
+        return true;
+    }
+
+    // [TAG_CACHE_BG_SAVE] prompt_save without stopping the device, for a conversation about to be cleared: the entry, its draft
+    // state and its checkpoints (moved, not copied: the slot is cleared after) are filled now, its target state by
+    // llama_state_seq_get_data_bg. Returns 2 while that copy runs (bg_saving, the entry busy; prompt_save_poll clears the slot
+    // when it is done), 1 when the state was saved synchronously instead (the caller clears the slot), 0 when not saved
+    int prompt_save_bg(server_prompt_cache & prompt_cache) {
+        static const size_t min_tokens = [] {
+            const char * e = getenv("LLAMA_CACHE_MIN_TOKENS");
+            return (size_t) (e ? std::max(0, atoi(e)) : 8192);
+        }();
+        if (prompt.tokens.size() == 0 || prompt.tokens.size() < min_tokens) {
+            return 0;
+        }
+
+        const int64_t t0 = ggml_time_us();
+        const size_t cur_size_tgt =           llama_state_seq_get_size_ext(ctx_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE);
+        const size_t cur_size_dft = ctx_dft ? llama_state_seq_get_size_ext(ctx_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE) : 0;
+
+        std::vector<uint8_t> cur_spec;
+        if (spec && common_speculative_state_valid(spec, id, prompt.tokens.pos_next())) {
+            common_speculative_get_state(spec, id, cur_spec);
+        }
+
+        auto * cur = prompt_cache.alloc(prompt, cur_size_tgt, cur_size_dft, cur_spec.size());
+        if (cur == nullptr) {
+            return 0;
+        }
+        const int64_t t1 = ggml_time_us();
+
+        const int32_t ticket = llama_state_seq_get_data_bg(ctx_tgt, cur->data.main.data(), cur_size_tgt, id);
+        if (ticket <= 0) {
+            llama_state_seq_get_data_ext(ctx_tgt, cur->data.main.data(), cur_size_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE);
+        }
+        const int64_t t2 = ggml_time_us();
+        // the draft's state the same way when the target's goes in the background (its cache is fragmented like the target's:
+        // 40 MiB of a 13k-token conversation took 247 ms of blocking copies)
+        int32_t ticket_dft = 0;
+        if (ctx_dft) {
+            ticket_dft = ticket > 0 ? llama_state_seq_get_data_bg(ctx_dft, cur->data.drft.data(), cur_size_dft, id) : 0;
+            if (ticket_dft <= 0) {
+                ticket_dft = 0;
+                llama_state_seq_get_data_ext(ctx_dft, cur->data.drft.data(), cur_size_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE);
+            }
+        }
+        const int64_t t3 = ggml_time_us();
+        cur->data.spec = std::move(cur_spec);
+
+        // [TAG_CACHE_CKPT_KEEP] the newest checkpoints move into the entry: the slot is cleared once the state is in
+        const int64_t ckpt_min = server_prompt_cache_ckpt_min(prompt.checkpoints);
+        size_t n_moved = 0;
+        for (auto it = prompt.checkpoints.begin(); it != prompt.checkpoints.end();) {
+            if (it->n_tokens < ckpt_min) {
+                ++it;
+                continue;
+            }
+            auto nx = std::next(it);
+            cur->prompt.checkpoints.splice(cur->prompt.checkpoints.end(), prompt.checkpoints, it);
+            it = nx;
+            ++n_moved;
+        }
+
+        SLT_WRN(*this, "prompt %s: %zu tokens, alloc %.1f ms, target %.1f ms (%.1f MiB), draft %.1f ms (%.1f MiB), %zu checkpoints moved\n",
+                ticket > 0 ? "saving in the background" : "saved", prompt.tokens.size(), (t1 - t0) / 1e3,
+                (t2 - t1) / 1e3, cur_size_tgt / 1048576.0, (t3 - t2) / 1e3, cur_size_dft / 1048576.0, n_moved);
+        if (ticket <= 0) {
+            return 1;
+        }
+        cur->busy     = true;
+        bg_saving     = true;
+        bg_ticket     = ticket;
+        bg_ticket_dft = ticket_dft;
+        bg_failed     = false;
+        bg_entry      = cur;
+        bg_t0         = t0;
+        return 2;
+    }
+
+    // [TAG_CACHE_BG_SAVE] true when the background save ended: the entry is ready (or dropped if the copy failed) and the slot is
+    // cleared. LLAMA_CACHE_BG_VERIFY=1 compares the entry's state with a synchronous save of the same, untouched cells (it
+    // stops the device: for tests)
+    bool prompt_save_poll(server_prompt_cache * prompt_cache) {
+        if (!bg_saving) {
+            return false;
+        }
+        for (auto [ctx, t] : { std::pair<llama_context *, int32_t *>{ ctx_tgt, &bg_ticket }, { ctx_dft, &bg_ticket_dft } }) {
+            if (*t > 0) {
+                const int32_t r = llama_state_seq_bg_poll(ctx, *t);
+                if (r != 0) {
+                    bg_failed = bg_failed || r < 0;
+                    *t = 0;
+                }
+            }
+        }
+        if (bg_ticket > 0 || bg_ticket_dft > 0) {
+            return false;
+        }
+        const int32_t r = bg_failed ? -1 : 1;
+        static const bool verify = [] { const char * e = getenv("LLAMA_CACHE_BG_VERIFY"); return e != nullptr && atoi(e) != 0; }();
+        if (r > 0 && verify) {
+            for (auto [ctx, data, name] : { std::tuple<llama_context *, server_state_bytes *, const char *>{ ctx_tgt, &bg_entry->data.main, "target" },
+                                            { ctx_dft, &bg_entry->data.drft, "draft" } }) {
+                if (ctx == nullptr || data->empty()) {
+                    continue;
+                }
+                std::vector<uint8_t> ref(data->size());
+                const size_t n = llama_state_seq_get_data_ext(ctx, ref.data(), ref.size(), id, LLAMA_STATE_SEQ_FLAGS_NONE);
+                const bool same = n == ref.size() && memcmp(ref.data(), data->data(), ref.size()) == 0;
+                SLT_WRN(*this, "background save verify, %s: %.1f MiB against a synchronous save: %s\n", name, ref.size() / 1048576.0,
+                        same ? "identical" : "MISMATCH");
+            }
+        }
+        if (prompt_cache) {
+            if (r > 0) {
+                bg_entry->busy = false;
+                prompt_cache->update();
+            } else {
+                server_prompt_cache_state * e = bg_entry;
+                prompt_cache->states.remove_if([e](const server_prompt_cache_state & st) { return &st == e; });
+            }
+        }
+        SLT_WRN(*this, "prompt saved in the background: %zu tokens, %.1f ms after the save began%s\n", prompt.tokens.size(),
+                (ggml_time_us() - bg_t0) / 1e3, r > 0 ? "" : ", the copy FAILED (not cached)");
+        bg_saving = false;
+        bg_ticket = 0;
+        bg_entry  = nullptr;
+        prompt_clear();
         return true;
     }
 
@@ -2176,7 +2321,7 @@ private:
         if (task.id_slot != -1) {
             ret = get_slot_by_id(task.id_slot);
             // the job's slot is not touched before the job ends
-            if (ret && ret->tu_owned) {
+            if (ret && ret->held()) {
                 LOG_WRN("[scheduler] slot_select: t_us=%" PRId64 " id_task=%d req_id_slot=%d chosen_slot=-1 reason=by_id_tu_owned task_tokens=%d\n",
                         ggml_time_us(), task.id, task.id_slot, task.n_tokens());
                 return nullptr;
@@ -2198,7 +2343,7 @@ private:
             static const float sim_keep = [] { const char * e = getenv("LLAMA_SLOT_SIM_KEEP"); return e ? (float) atof(e) : 0.5f; }();
             bool have_empty = false;
             for (const server_slot & s : slots) {
-                have_empty = have_empty || (!s.is_processing() && !s.tu_owned && s.prompt.tokens.empty());
+                have_empty = have_empty || (!s.is_processing() && !s.held() && s.prompt.tokens.empty());
             }
 
             for (server_slot & slot : slots) {
@@ -2207,7 +2352,7 @@ private:
                 }
 
                 // skip the slot if it is not available
-                if (slot.is_processing() || slot.tu_owned) {
+                if (slot.is_processing() || slot.held()) {
                     SLT_TRC(slot, " - skipping, is_processing = %d\n", slot.is_processing());
                     continue;
                 }
@@ -2265,7 +2410,7 @@ private:
 
             for (server_slot & slot : slots) {
                 // skip the slot if it is not available
-                if (slot.is_processing() || slot.tu_owned) {
+                if (slot.is_processing() || slot.held()) {
                     continue;
                 }
 
@@ -2302,7 +2447,7 @@ private:
             if (tu_policy.fix && update_cache) {
                 bool peer_busy = false;
                 for (const auto & s : slots) {
-                    if (&s != ret && (s.is_processing() || s.tu_owned)) {
+                    if (&s != ret && (s.is_processing() || s.held())) {
                         peer_busy = true;
                         break;
                     }
@@ -2342,7 +2487,7 @@ private:
                         const size_t n_own = ret->prompt.tokens.size(); // the restore replaces the slot's own cells
                         std::vector<server_slot *> idle;
                         for (auto & s : slots) {
-                            if (&s != ret && !s.is_processing() && !s.tu_owned && !s.prompt.tokens.empty() && s.prompt.tokens.size() < n_entry) {
+                            if (&s != ret && !s.is_processing() && !s.held() && !s.prompt.tokens.empty() && s.prompt.tokens.size() < n_entry) {
                                 idle.push_back(&s);
                             }
                         }
@@ -2362,7 +2507,7 @@ private:
                         if (restore) {
                             std::vector<llama_seq_id> seqs;
                             for (auto & s : slots) {
-                                if (&s != ret && !s.is_processing() && !s.tu_owned) {
+                                if (&s != ret && !s.is_processing() && !s.held()) {
                                     seqs.push_back(s.id);
                                 }
                             }
@@ -3268,11 +3413,11 @@ private:
                         break;
                     }
 
-                    if (slot->is_processing() || slot->tu_owned) {
+                    if (slot->is_processing() || slot->held()) {
                         // if requested slot is unavailable, we defer this task for processing later
                         LOG_WRN("[scheduler] task_deferred: t_us=%" PRId64 " id_task=%d req_id_slot=%d slot=%d reason=%s task_tokens=%d\n",
                                 ggml_time_us(), id_task, task.id_slot, slot->id,
-                                slot->tu_owned ? "slot_tu_owned" : "slot_processing", task.n_tokens());
+                                slot->bg_saving ? "slot_bg_saving" : slot->tu_owned ? "slot_tu_owned" : "slot_processing", task.n_tokens());
                         SRV_DBG("requested slot is unavailable, defer task, id_task = %d\n", id_task);
                         queue_tasks.defer(std::move(task));
                         break;
@@ -3298,7 +3443,7 @@ private:
 
                     if (params_base.cache_idle_slots) {
                         for (auto & slot : slots) {
-                            if (!slot.is_processing() && !slot.tu_owned) {
+                            if (!slot.is_processing() && !slot.held()) {
                                 SLT_TRC(slot, "%s", "saving idle slot to prompt cache\n");
 
                                 if (slot.prompt_save(*prompt_cache)) {
@@ -3457,7 +3602,7 @@ private:
                         send_error(task, "Invalid slot ID", ERROR_TYPE_INVALID_REQUEST);
                         break;
                     }
-                    if (slot->is_processing() || slot->tu_owned) {
+                    if (slot->is_processing() || slot->held()) {
                         // if requested slot is unavailable, we defer this task for processing later
                         SRV_DBG("requested slot is unavailable, defer task, id_task = %d\n", task.id);
                         queue_tasks.defer(std::move(task));
@@ -3507,7 +3652,7 @@ private:
                         send_error(task, "Invalid slot ID", ERROR_TYPE_INVALID_REQUEST);
                         break;
                     }
-                    if (slot->is_processing() || slot->tu_owned) {
+                    if (slot->is_processing() || slot->held()) {
                         // if requested slot is unavailable, we defer this task for processing later
                         SRV_DBG("requested slot is unavailable, defer task, id_task = %d\n", task.id);
                         queue_tasks.defer(std::move(task));
@@ -3576,7 +3721,7 @@ private:
                         send_error(task, "Invalid slot ID", ERROR_TYPE_INVALID_REQUEST);
                         break;
                     }
-                    if (slot->is_processing() || slot->tu_owned) {
+                    if (slot->is_processing() || slot->held()) {
                         // if requested slot is unavailable, we defer this task for processing later
                         SRV_DBG("requested slot is unavailable, defer task, id_task = %d\n", task.id);
                         queue_tasks.defer(std::move(task));
@@ -4498,6 +4643,14 @@ private:
 
     void update_slots() {
         GGML_RT_SCOPE("srv.update_slots");
+
+        // [TAG_CACHE_BG_SAVE] the background saves that ended: their slots are cleared
+        n_bg_saving = 0;
+        for (auto & s : slots) {
+            if (s.bg_saving && !s.prompt_save_poll(prompt_cache.get())) {
+                ++n_bg_saving;
+            }
+        }
 #ifdef DEBUG_TIMINGS
         static int64_t t_prev = 0;
         int64_t t_start = ggml_time_us();
@@ -4581,7 +4734,15 @@ private:
         if (batch_tu.size() > 0) {
             tu_start();
         }
+
+        // [TAG_CACHE_BG_SAVE] a round with nothing to decode while a prompt waits for a background save: the loop comes back
+        // without spinning
+        if (batch.size() == 0 && batch_tu.size() == 0 && n_bg_saving > 0) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
     }
+
+    int32_t n_bg_saving = 0; // [TAG_CACHE_BG_SAVE] the slots whose conversation is being saved in the background
 
     // decodes the batch pre_decode() built, in chunks of n_batch, each with its drafter pass and post_decode()
     void run_batch() {
@@ -6111,7 +6272,7 @@ private:
                             // a conversation another one sat right after, and each cleared a 37-52k-token conversation)
                             std::vector<llama_seq_id> seqs;
                             for (auto & s : slots) {
-                                if (&s != &slot && !s.is_processing() && !s.tu_owned) {
+                                if (&s != &slot && !s.is_processing() && !s.held()) {
                                     seqs.push_back(s.id);
                                 }
                             }
@@ -6164,11 +6325,17 @@ private:
                             std::vector<server_slot *> idle;
                             std::vector<server_slot *> longer;
                             for (auto & s : slots) {
-                                if (&s == &slot || s.is_processing() || s.tu_owned || s.prompt.tokens.empty()) {
+                                if (&s == &slot || s.is_processing() || s.held() || s.prompt.tokens.empty()) {
                                     continue;
                                 }
                                 ((int32_t) s.prompt.tokens.size() < slot.task->n_tokens() ? idle : longer).push_back(&s);
                             }
+                            // [TAG_CACHE_BG_SAVE] the cells of the conversations being saved in the background, free once their copies end
+                            int64_t pending = 0;
+                            for (const auto & s : slots) {
+                                pending += s.bg_saving ? (int64_t) s.prompt.tokens.size() : 0;
+                            }
+                            bool started = false;
                             auto lru = [](const server_slot * a, const server_slot * b) { return a->t_last_used < b->t_last_used; };
                             std::sort(idle.begin(),   idle.end(),   lru);
                             std::sort(longer.begin(), longer.end(), lru);
@@ -6181,8 +6348,19 @@ private:
                                 if ((uint64_t) n_add <= room && !admit_short()) {
                                     break;
                                 }
+                                if (pending > 0 && (int64_t) llama_kv_n_free(ctx_tgt) + pending >= admit_need()) {
+                                    break; // enough once the saves under way end
+                                }
                                 const size_t n_was = s->prompt.tokens.size();
-                                const bool   saved = prompt_cache && s->prompt_save(*prompt_cache);
+                                const int    sv    = prompt_cache ? s->prompt_save_bg(*prompt_cache) : 0;
+                                const bool   saved = sv > 0;
+                                if (sv == 2) {
+                                    pending += (int64_t) n_was;
+                                    started  = true;
+                                    LOG_WRN("[scheduler] kv_evict_idle: t_us=%" PRId64 " slot=%d saving=%zu in the background for_slot=%d n_add=%d free=%u\n",
+                                            ggml_time_us(), s->id, n_was, slot.id, n_add, llama_kv_n_free(ctx_tgt));
+                                    continue;
+                                }
                                 if (saved) {
                                     prompt_cache->update();
                                 } else if (k >= n_shorter) {
@@ -6197,6 +6375,15 @@ private:
                                 }
                                 LOG_WRN("[scheduler] kv_evict_idle: t_us=%" PRId64 " slot=%d cleared=%zu%s for_slot=%d n_add=%d room=%u free=%u\n",
                                         ggml_time_us(), s->id, n_was, saved ? " (saved)" : "", slot.id, n_add, room, llama_kv_n_free(ctx_tgt));
+                            }
+                            // [TAG_CACHE_BG_SAVE] still short while conversations are being saved: the prompt waits for their cells
+                            // (polled at every round's start) and the other slots go on; it is not refused meanwhile
+                            if (pending > 0 && ((uint64_t) n_add > room || admit_short())) {
+                                if (started) {
+                                    LOG_WRN("[scheduler] kv_evict_wait: t_us=%" PRId64 " slot=%d n_add=%d free=%u pending=%" PRId64 "\n",
+                                            ggml_time_us(), slot.id, n_add, llama_kv_n_free(ctx_tgt), pending);
+                                }
+                                return;
                             }
                         }
 

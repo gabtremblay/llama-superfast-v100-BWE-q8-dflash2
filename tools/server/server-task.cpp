@@ -1784,7 +1784,7 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
     for (auto it = states.begin(); it != states.end();) {
         const int len = it->prompt.tokens.get_common_prefix(prompt.tokens);
 
-        if (len == (int) it->prompt.tokens.size()) {
+        if (len == (int) it->prompt.tokens.size() && !it->busy) {
             SRV_TRC(" - removing obsolete cached prompt with length %d\n", len);
 
             it = states.erase(it);
@@ -1796,23 +1796,24 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
     // the state buffers of the entries removed to make room are reused for the new entry: a fresh vector of the size
     // (150+ MiB) paid its page faults and zero fill on every save once the cache was full (~250 ms with the checkpoint
     // copies, on a 27B hybrid model's 160 MiB state)
-    std::vector<uint8_t> state_data_tgt;
-    std::vector<uint8_t> state_data_dft;
+    server_state_bytes state_data_tgt;
+    server_state_bytes state_data_dft;
 
     if (limit_size > 0) {
         // make room before allocating the new vectors to avoid breaching the limit
-        while (!states.empty() && size() + state_size_new > limit_size) {
+        while (oldest_idle() != states.end() && size() + state_size_new > limit_size) {
+            auto it = oldest_idle();
             SRV_WRN(" - making room for prompt cache entry, removing oldest entry (size = %.3f MiB)\n",
-                    states.front().size() / (1024.0 * 1024.0));
+                    it->size() / (1024.0 * 1024.0));
 
-            auto & old = states.front().data;
+            auto & old = it->data;
             if (old.main.capacity() > state_data_tgt.capacity()) {
                 state_data_tgt = std::move(old.main);
             }
             if (old.drft.capacity() > state_data_dft.capacity()) {
                 state_data_dft = std::move(old.drft);
             }
-            states.pop_front();
+            states.erase(it);
         }
     }
 
@@ -1833,8 +1834,8 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
             return avail == SIZE_MAX || avail + std::min(reuse, state_size_tgt + state_size_dft) >= need;
         };
         size_t n_dropped = 0;
-        while (!states.empty() && !room()) {
-            states.pop_front();
+        while (oldest_idle() != states.end() && !room()) {
+            states.erase(oldest_idle());
             ++n_dropped;
             avail = cache_host_mem_available();
         }
@@ -1889,6 +1890,9 @@ size_t server_prompt_cache::restore_n_tokens(const server_prompt & prompt, const
 
     size_t n_best = 0;
     for (auto it = states.begin(); it != states.end(); ++it) {
+        if (it->busy) {
+            continue;
+        }
         const int lcp_cur = it->prompt.tokens.get_common_prefix(tokens_new);
 
         const float f_keep_cur = float(lcp_cur) / it->prompt.tokens.size();
@@ -1923,6 +1927,9 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
 
     // find the most similar cached prompt, that would also preserve the most context
     for (auto it = states.begin(); it != states.end(); ++it) {
+        if (it->busy) {
+            continue;
+        }
         const int lcp_cur = it->prompt.tokens.get_common_prefix(tokens_new);
 
         const float f_keep_cur = float(lcp_cur) / it->prompt.tokens.size();
@@ -1995,12 +2002,20 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
     return true;
 }
 
+std::list<server_prompt_cache_state>::iterator server_prompt_cache::oldest_idle() {
+    auto it = states.begin();
+    while (it != states.end() && it->busy) {
+        ++it;
+    }
+    return it;
+}
+
 void server_prompt_cache::update() {
     if (limit_size > 0) {
-        while (!states.empty() && size() > limit_size) {
-            SRV_WRN(" - cache size limit reached, removing oldest entry (size = %.3f MiB)\n", states.front().size() / (1024.0 * 1024.0));
+        while (oldest_idle() != states.end() && size() > limit_size) {
+            SRV_WRN(" - cache size limit reached, removing oldest entry (size = %.3f MiB)\n", oldest_idle()->size() / (1024.0 * 1024.0));
 
-            states.pop_front();
+            states.erase(oldest_idle());
         }
     }
 
@@ -2011,11 +2026,11 @@ void server_prompt_cache::update() {
     const size_t limit_tokens_cur = limit_size > 0 ? std::max<size_t>(limit_tokens, limit_size/size_per_token) : limit_tokens;
 
     if (limit_tokens > 0) {
-        while (!states.empty() && n_tokens() > limit_tokens_cur) {
+        while (oldest_idle() != states.end() && n_tokens() > limit_tokens_cur) {
             SRV_WRN(" - cache token limit (%zu, est: %zu) reached, removing oldest entry (size = %.3f MiB)\n",
-                    limit_tokens, limit_tokens_cur, states.front().size() / (1024.0 * 1024.0));
+                    limit_tokens, limit_tokens_cur, oldest_idle()->size() / (1024.0 * 1024.0));
 
-            states.pop_front();
+            states.erase(oldest_idle());
         }
     }
 

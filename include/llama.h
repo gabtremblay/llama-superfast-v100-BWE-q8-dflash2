@@ -1044,6 +1044,19 @@ extern "C" {
     // returns when every copy queued with LLAMA_STATE_SEQ_FLAGS_ASYNC on this context is done
     LLAMA_API void llama_state_seq_wait(struct llama_context * ctx);
 
+    // [TAG_CACHE_BG_SAVE] llama_state_seq_get_data_ext (no flags) without stopping the device: the header and the cells'
+    // metadata are written before it returns, the tensor bytes by a worker thread on a stream of its own. Returns a ticket
+    // (> 0), or 0 when the state cannot be saved this way (then save it with llama_state_seq_get_data_ext). The sequence's
+    // cells and rows must not change, nor dst be read or freed, until llama_state_seq_bg_poll returns non-zero for the ticket
+    LLAMA_API int32_t llama_state_seq_get_data_bg(
+            struct llama_context * ctx,
+                         uint8_t * dst,
+                          size_t   size,
+                    llama_seq_id   seq_id);
+
+    // 1: the bytes are in dst; 0: still copying; -1: failed or unknown ticket (dst holds nothing usable)
+    LLAMA_API int32_t llama_state_seq_bg_poll(struct llama_context * ctx, int32_t ticket);
+
     //
     // Decoding
     //

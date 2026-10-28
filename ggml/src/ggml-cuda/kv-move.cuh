@@ -14,3 +14,7 @@ struct kv_move_tensor {
 // not overlap it, and no move reads rows an earlier move wrote (the caller checks both)
 void ggml_cuda_kv_move_rows(ggml_backend_cuda_context & ctx, const kv_move_tensor * tensors, int n_tensors,
         const uint32_t * moves, int n_moves);
+
+// [TAG_CACHE_BG_SAVE] byte ranges gathered into one device buffer in one launch: ranges [n][3] = source address, offset in dst,
+// bytes. The ranges must not overlap dst
+void ggml_cuda_gather_bytes(ggml_backend_cuda_context & ctx, const uint64_t * ranges, int n, char * dst);

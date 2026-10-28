@@ -607,9 +607,27 @@ struct server_prompt {
     }
 };
 
+// [TAG_CACHE_BG_SAVE] a byte buffer whose resize leaves the new bytes as they are: an entry's state (855 MiB for a 20k-token
+// conversation) is written in full right after its allocation, and zeroing it cost the main thread 178 ms of page faults; the
+// background save's worker thread takes them as it writes
+template <typename T>
+struct server_noinit_allocator : std::allocator<T> {
+    template <typename U> struct rebind { using other = server_noinit_allocator<U>; };
+    server_noinit_allocator() = default;
+    template <typename U> server_noinit_allocator(const server_noinit_allocator<U> &) noexcept {}
+    template <typename U, typename... A> void construct(U * p, A &&... a) {
+        if constexpr (sizeof...(A) == 0) {
+            ::new ((void *) p) U;
+        } else {
+            ::new ((void *) p) U(std::forward<A>(a)...);
+        }
+    }
+};
+using server_state_bytes = std::vector<uint8_t, server_noinit_allocator<uint8_t>>;
+
 struct server_prompt_data {
-    std::vector<uint8_t> main;
-    std::vector<uint8_t> drft;
+    server_state_bytes main;
+    server_state_bytes drft;
     std::vector<uint8_t> spec; // the speculative state at the entry's live endpoint (common_speculative_get_state)
 
     size_t size() const {
@@ -620,6 +638,9 @@ struct server_prompt_data {
 struct server_prompt_cache_state {
     server_prompt prompt;
     server_prompt_data data;
+
+    // [TAG_CACHE_BG_SAVE] its state is still being copied in (server_slot::prompt_save_bg): not loaded, dropped or reused
+    bool busy = false;
 
     size_t size() const {
         size_t res = data.size();
@@ -667,6 +688,9 @@ struct server_prompt_cache {
 
     // [TAG_CACHE_ROOM] the tokens of the entry load() would restore for tokens_new into a slot holding prompt (0: none)
     size_t restore_n_tokens(const server_prompt & prompt, const server_tokens & tokens_new) const;
+
+    // [TAG_CACHE_BG_SAVE] the oldest entry not being written (states.end() when there is none)
+    std::list<server_prompt_cache_state>::iterator oldest_idle();
 };
 
 // used exclusively by router mode

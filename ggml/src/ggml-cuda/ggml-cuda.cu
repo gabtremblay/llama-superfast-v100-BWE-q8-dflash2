@@ -1222,6 +1222,19 @@ static bool ggml_backend_cuda_kv_move_rows(ggml_backend_t backend, ggml_tensor *
     return true;
 }
 
+// [TAG_CACHE_BG_SAVE] byte ranges of this device's buffers gathered into dst (a buffer of this device) on the backend's stream,
+// in one launch: ranges [n][3] = source address, offset in dst, bytes. false, with nothing queued, for another backend
+static bool ggml_backend_cuda_gather_bytes(ggml_backend_t backend, const uint64_t * ranges, int n, void * dst) {
+    if (backend == nullptr || !ggml_backend_is_cuda(backend) || n < 0 || (n > 0 && (ranges == nullptr || dst == nullptr))) {
+        return false;
+    }
+    ggml_backend_cuda_context * ctx = (ggml_backend_cuda_context *) backend->context;
+    GGML_RT_SCOPE("cuda.gather_bytes");
+    ggml_cuda_set_device(ctx->device);
+    ggml_cuda_gather_bytes(*ctx, ranges, n, (char *) dst);
+    return true;
+}
+
 static void ggml_backend_cuda_upload_sync(ggml_tensor * tensor) {
     ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buf->context;
@@ -9442,6 +9455,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_cuda_kv_move_rows") == 0) {
         return (void *)ggml_backend_cuda_kv_move_rows;
+    }
+    if (strcmp(name, "ggml_backend_cuda_gather_bytes") == 0) {
+        return (void *)ggml_backend_cuda_gather_bytes;
     }
     if (strcmp(name, "ggml_backend_cuda_fattn_stream_limits") == 0) {
         return (void *)ggml_cuda_fattn_verify_stream_limits;

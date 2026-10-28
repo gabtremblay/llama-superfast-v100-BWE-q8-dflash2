@@ -182,6 +182,10 @@ struct llama_context {
     // waits for the copies queued by state_seq_get_data with LLAMA_STATE_SEQ_FLAGS_ASYNC
     void state_seq_wait();
 
+    // [TAG_CACHE_BG_SAVE] llama_state_seq_get_data_bg / llama_state_seq_bg_poll
+    int32_t state_seq_get_data_bg(llama_seq_id seq_id, uint8_t * dst, size_t size);
+    int32_t state_seq_bg_poll(int32_t ticket);
+
     // [TAG_CKPT_STAGE] queues an async state get's tensor writes through the staging buffer; false: not staged, nothing queued
     bool state_stage_writes(const std::vector<llama_state_write_info> & writes, const std::vector<ggml_backend_t> & cands);
 
@@ -756,4 +760,11 @@ private:
     mutable int32_t n_eval   = 0; // number of eval calls
 
     mutable int32_t n_reused = 0; // number of times the previous graph was reused
+
+    // [TAG_CACHE_BG_SAVE] the background saver of this context's device: its worker thread, stream, staging and pinned buffers,
+    // made on the first save and shared by the contexts on the device (the target's and the draft's), and the tickets this
+    // context submitted that are not polled done (waited for before the context frees what they read)
+    std::shared_ptr<struct llama_bg_saver> bg_saver;
+    std::vector<int32_t>                   bg_tickets;
+    bool bg_off = false; // set once the saver is found unavailable
 };
