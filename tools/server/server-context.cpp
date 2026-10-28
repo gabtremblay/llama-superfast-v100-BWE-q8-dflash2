@@ -409,8 +409,9 @@ struct server_slot {
             }
         }
 
-        SRV_TRC(" - prompt saved: alloc %.1f ms, state %.1f ms (%.1f MiB), checkpoints %.1f ms (%zu moved, %zu copied, %zu left out)\n",
-                (t1 - t0) / 1e3, (t2 - t1) / 1e3, cur_size / 1048576.0, (ggml_time_us() - t2) / 1e3,
+        // [TAG_CACHE_SAVE_LOG] one line a save: where a save that holds every slot spends its time
+        SRV_WRN("prompt saved: %zu tokens, alloc %.1f ms, state %.1f ms (%.1f MiB), checkpoints %.1f ms (%zu moved, %zu copied, %zu left out)\n",
+                prompt.tokens.size(), (t1 - t0) / 1e3, (t2 - t1) / 1e3, cur_size / 1048576.0, (ggml_time_us() - t2) / 1e3,
                 n_moved, cur->prompt.checkpoints.size() - n_moved, n_skipped);
 
         return true;
@@ -6136,30 +6137,66 @@ private:
                                         ggml_time_us(), slot.id, moved, seqs.size(), (ggml_time_us() - t0)/1000.0, n_add, room);
                             }
                         }
-                        if (kv_evict_idle && n_add > 0 && (uint64_t) n_add > room) {
-                            std::vector<server_slot *> idle;
-                            for (auto & s : slots) {
-                                if (&s != &slot && !s.is_processing() && !s.tu_owned && !s.prompt.tokens.empty() &&
-                                        (int32_t) s.prompt.tokens.size() < slot.task->n_tokens()) {
-                                    idle.push_back(&s);
+                        // [TAG_KV_ADMIT] what the admission below asks of the pool's free cells: the new tokens, the answer's
+                        // margin and the other slots' unread prompts
+                        static const bool    kv_admit     = [] { const char * e = getenv("LLAMA_KV_ADMIT"); return e ? atoi(e) != 0 : true; }();
+                        static const int64_t admit_margin = [] { const char * e = getenv("LLAMA_KV_ADMIT_MARGIN"); return (int64_t) (e ? std::max(0, atoi(e)) : 2048); }();
+                        auto admit_need = [&]() {
+                            int64_t need = n_add + admit_margin;
+                            for (const auto & s : slots) {
+                                if (&s == &slot || !s.is_processing() || s.task == nullptr) {
+                                    continue;
                                 }
+                                need += std::max<int64_t>(0, (int64_t) s.task->n_tokens() - (int64_t) s.prompt.n_tokens());
                             }
-                            std::sort(idle.begin(), idle.end(), [](const server_slot * a, const server_slot * b) { return a->t_last_used < b->t_last_used; });
-                            for (server_slot * s : idle) {
-                                if ((uint64_t) n_add <= room) {
+                            return need;
+                        };
+                        auto admit_short = [&]() {
+                            const uint32_t f = llama_kv_n_free(ctx_tgt);
+                            return kv_admit && f != UINT32_MAX && (int64_t) f < admit_need();
+                        };
+                        // [TAG_KV_EVICT_IDLE] a longer idle conversation is cleared too when the shorter ones were not enough,
+                        // the least recently used first, but only once the prompt cache holds it (it comes back in about a
+                        // second: 38,836 tokens in 0.57 s), so it never costs a re-read. Keeping every longer one refused a
+                        // main thread's new 18,478-token prompt in production beside an idle 121k-token conversation (8,532
+                        // cells free); without a cache, or when its save fails, a longer one stays as before
+                        if (kv_evict_idle && n_add > 0 && ((uint64_t) n_add > room || admit_short())) {
+                            std::vector<server_slot *> idle;
+                            std::vector<server_slot *> longer;
+                            for (auto & s : slots) {
+                                if (&s == &slot || s.is_processing() || s.tu_owned || s.prompt.tokens.empty()) {
+                                    continue;
+                                }
+                                ((int32_t) s.prompt.tokens.size() < slot.task->n_tokens() ? idle : longer).push_back(&s);
+                            }
+                            auto lru = [](const server_slot * a, const server_slot * b) { return a->t_last_used < b->t_last_used; };
+                            std::sort(idle.begin(),   idle.end(),   lru);
+                            std::sort(longer.begin(), longer.end(), lru);
+                            const size_t n_shorter = idle.size();
+                            if (prompt_cache) {
+                                idle.insert(idle.end(), longer.begin(), longer.end());
+                            }
+                            for (size_t k = 0; k < idle.size(); ++k) {
+                                server_slot * s = idle[k];
+                                if ((uint64_t) n_add <= room && !admit_short()) {
                                     break;
                                 }
                                 const size_t n_was = s->prompt.tokens.size();
-                                if (prompt_cache && s->prompt_save(*prompt_cache)) {
+                                const bool   saved = prompt_cache && s->prompt_save(*prompt_cache);
+                                if (saved) {
                                     prompt_cache->update();
+                                } else if (k >= n_shorter) {
+                                    LOG_WRN("[scheduler] kv_evict_idle: t_us=%" PRId64 " slot=%d kept=%zu for_slot=%d: the prompt cache did not take it\n",
+                                            ggml_time_us(), s->id, n_was, slot.id);
+                                    continue;
                                 }
                                 s->prompt_clear();
                                 room = llama_kv_room(ctx_tgt, slot.id);
                                 if ((uint64_t) n_add > room && llama_kv_compact_seq(ctx_tgt, slot.id, (uint32_t) n_add)) {
                                     room = llama_kv_room(ctx_tgt, slot.id);
                                 }
-                                LOG_WRN("[scheduler] kv_evict_idle: t_us=%" PRId64 " slot=%d cleared=%zu for_slot=%d n_add=%d room=%u\n",
-                                        ggml_time_us(), s->id, n_was, slot.id, n_add, room);
+                                LOG_WRN("[scheduler] kv_evict_idle: t_us=%" PRId64 " slot=%d cleared=%zu%s for_slot=%d n_add=%d room=%u free=%u\n",
+                                        ggml_time_us(), s->id, n_was, saved ? " (saved)" : "", slot.id, n_add, room, llama_kv_n_free(ctx_tgt));
                             }
                         }
 
@@ -6170,17 +6207,9 @@ private:
                         // refused now with the context-size error, instead of read for minutes beside the other slots and
                         // failed when the pool runs out (a 58k-token and a 22k-token read beside a 105k and a 93k conversation
                         // in a 262,144-token pool). LLAMA_KV_ADMIT=0 turns it off
-                        static const bool    kv_admit     = [] { const char * e = getenv("LLAMA_KV_ADMIT"); return e ? atoi(e) != 0 : true; }();
-                        static const int64_t admit_margin = [] { const char * e = getenv("LLAMA_KV_ADMIT_MARGIN"); return (int64_t) (e ? std::max(0, atoi(e)) : 2048); }();
                         const uint32_t n_free = llama_kv_n_free(ctx_tgt);
                         if (kv_admit && n_add > 0 && n_free != UINT32_MAX) {
-                            int64_t need = n_add + admit_margin;
-                            for (const auto & s : slots) {
-                                if (&s == &slot || !s.is_processing() || s.task == nullptr) {
-                                    continue;
-                                }
-                                need += std::max<int64_t>(0, (int64_t) s.task->n_tokens() - (int64_t) s.prompt.n_tokens());
-                            }
+                            const int64_t need = admit_need();
                             if ((int64_t) n_free < need) {
                                 LOG_WRN("[scheduler] kv_admit_refused: t_us=%" PRId64 " slot=%d id_task=%d n_add=%d need=%" PRId64 " free=%u\n",
                                         ggml_time_us(), slot.id, slot.task->id, n_add, need, n_free);
