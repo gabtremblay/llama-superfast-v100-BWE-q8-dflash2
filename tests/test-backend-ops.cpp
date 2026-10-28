@@ -9076,6 +9076,51 @@ struct test_flash_attn_ext : public test_case {
     }
 };
 
+// GGML_OP_FLASH_ATTN_EXT with the mask of a joint multi-sequence batch: each query row belongs to one of up to four
+// sequences and sees only that sequence's cells (blocks of 192 keys owned round-robin, so 64-key tiles are whole,
+// partly or not at all visible to a row), a 128-key shared prefix, a 256-key hole of free cells no row sees, and the
+// batch's own cells at the end, causal within the sequence. Tiles that no row of an 8-row block sees are skipped by
+// the streaming verify kernel; this checks the skip against the reference.
+struct test_flash_attn_ext_seqs : public test_flash_attn_ext {
+    using test_flash_attn_ext::test_flash_attn_ext;
+
+    std::string vars() override {
+        return test_flash_attn_ext::vars() + ",mask=seqs";
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        test_flash_attn_ext::initialize_tensors(ctx);
+
+        ggml_tensor * t = ggml_get_tensor(ctx, "m");
+        GGML_ASSERT(t && t->type == GGML_TYPE_F16);
+        const int64_t n_kv = t->ne[0], n_rows = t->ne[1], n_strm = t->ne[3];
+        const int64_t n_seq = std::min<int64_t>(n_rows, 4), blk = 192, n_pre = 128, hole0 = n_kv*3/4, hole1 = hole0 + 256;
+        const int64_t batch0 = n_kv - n_rows; // the batch's own cells, one per row
+
+        std::vector<float> data(ggml_nelements(t), -INFINITY);
+        for (int64_t s = 0; s < n_strm; ++s) {
+            for (int64_t r = 0; r < n_rows; ++r) {
+                const int64_t seq = (r*n_seq/n_rows + s) % n_seq;
+                float * row = data.data() + (s*n_rows + r)*n_kv;
+                for (int64_t k = 0; k < batch0; ++k) {
+                    const bool hole = k >= hole0 && k < hole1;
+                    if (!hole && (k < n_pre || (k/blk + s) % n_seq == seq)) {
+                        row[k] = -0.0625f*((k + r) % 5);
+                    }
+                }
+                for (int64_t j = 0; j <= r; ++j) {
+                    if ((j*n_seq/n_rows + s) % n_seq == seq) {
+                        row[batch0 + j] = 0.0f;
+                    }
+                }
+            }
+        }
+        std::vector<ggml_fp16_t> data_f16(data.size());
+        ggml_fp32_to_fp16_row(data.data(), data_f16.data(), data_f16.size());
+        ggml_backend_tensor_set(t, data_f16.data(), 0, data_f16.size()*sizeof(ggml_fp16_t));
+    }
+};
+
 // GGML_OP_FLASH_ATTN_EXT_BANDED
 struct test_flash_attn_ext_banded : public test_case {
     const int64_t d;
@@ -12258,6 +12303,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             for (int64_t kv : {4096, 20480}) {
                 for (int64_t nb : {1, 3, 8, 9, 16}) {
                     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, ns}, kv, nb, true, false, 0, 0, GGML_PREC_F32, t, t, {0, 2, 1, 3}));
+                }
+            }
+        }
+    }
+    // the same calls with the mask of a joint batch of up to four sequences (tiles no row of a block sees are skipped)
+    for (ggml_type t : {GGML_TYPE_F16, GGML_TYPE_Q8_0}) {
+        for (int64_t ns : {1, 2}) {
+            for (int64_t kv : {4096, 20480}) {
+                for (int64_t nb : {4, 8, 9, 16}) {
+                    test_cases.emplace_back(new test_flash_attn_ext_seqs(256, 256, 4, {6, ns}, kv, nb, true, false, 0, 0, GGML_PREC_F32, t, t, {0, 2, 1, 3}));
                 }
             }
         }

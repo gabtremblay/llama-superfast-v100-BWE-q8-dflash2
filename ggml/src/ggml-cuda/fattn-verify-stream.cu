@@ -130,6 +130,21 @@ void ggml_cuda_flash_attn_ext_verify_stream(ggml_backend_cuda_context & ctx, ggm
     // result is bit-identical to it
     const int nhalf  = (n_tok + 7)/8;
 
+    // [TAG_FVS_SKIP] the used tiles of each (stream, 8-token half): a batch of several sequences reads only its rows' tiles,
+    // not the span of all their cells (LLAMA_FATTN_VERIFY_STREAM_SKIP=0: the span). One tiles_used launch per call
+    static const bool skip = [] { const char * e = getenv("LLAMA_FATTN_VERIFY_STREAM_SKIP"); return !e || atoi(e) != 0; }();
+    const int tstride = std::min(ntiles, fvs::TMAX);
+    const bool use_list = skip && ntiles <= fvs::TMAX;
+    ggml_cuda_pool_alloc<int32_t> tlist(ctx.pool());
+    ggml_cuda_pool_alloc<int32_t> tcount(ctx.pool());
+    if (use_list) {
+        tlist.alloc((size_t) n_strm*nhalf*tstride);
+        tcount.alloc((size_t) n_strm*nhalf);
+        fvs::tiles_used<<<dim3(nhalf, n_strm, 1), 256, 0, stream>>>((const char *) mask->data, mask->nb[1], mask->nb[3], n_tok, nhalf,
+            n_kv, kv_count, tlist.ptr, tcount.ptr, tstride);
+        CUDA_CHECK(cudaGetLastError());
+    }
+
     ggml_cuda_pool_alloc<float>  parts(ctx.pool());
     ggml_cuda_pool_alloc<float2> meta(ctx.pool());
     if (nsplit > 1) {
@@ -153,7 +168,7 @@ void ggml_cuda_flash_attn_ext_verify_stream(ggml_backend_cuda_context & ctx, ggm
         (const float *) Q->data, (const char *) K->data, (const char *) V->data, (const char *) mask->data,
         (float *) dst->data, parts.ptr, meta.ptr, n_tok, n_head, nkvh,
         Q->nb[1], Q->nb[2], K->nb[1], K->nb[2], V->nb[1], V->nb[2], mask->nb[1], n_kv, kv_count, nsplit, scale*1.4426950408889634f, nhalf,
-        Q->nb[3], K->nb[3], V->nb[3], mask->nb[3]);
+        Q->nb[3], K->nb[3], V->nb[3], mask->nb[3], use_list ? tlist.ptr : nullptr, use_list ? tcount.ptr : nullptr, tstride);
     CUDA_CHECK(cudaGetLastError());
 
     if (nsplit > 1) {

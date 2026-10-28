@@ -122,6 +122,60 @@ static __device__ __forceinline__ uint4 to_f16x8(const uint4 r) {
     }
 }
 
+// [TAG_FVS_SKIP] the tiles of TK keys where any of the 8-token half's rows is unmasked, per (half, stream): blockIdx.x = half,
+// blockIdx.y = stream, 256 threads. A masked key is -inf (0xFC00); this kernel is only taken without ALiBi or a softcap, so
+// any other value is a key the row reads. The flags go to shared memory, then warp 0 compacts them by ballot into
+// list[(stream*nhalf + half)*tstride ..] and their number into count[stream*nhalf + half]. TMAX tiles at most (n_kv/TK)
+constexpr int TMAX = 8192;
+__global__ void tiles_used(const char * __restrict__ mask, const int64_t nbm1, const int64_t nbm3, const int n_tok_all, const int nhalf,
+        const int n_kv, const int32_t * __restrict__ kv_count, int32_t * __restrict__ list, int32_t * __restrict__ count, const int tstride) {
+    __shared__ unsigned char used[TMAX];
+    const int hf     = blockIdx.x;
+    const int strm   = blockIdx.y;
+    const int tok0   = 8*hf;
+    const int n_tok  = min(8, n_tok_all - tok0);
+    const int ntiles = min((kv_count ? *kv_count : n_kv) / TK, TMAX);
+    mask += tok0*nbm1 + strm*nbm3;
+    // one thread per (tile, 8-key chunk): 8 halves of every row; a tile is used if any chunk of any row holds a non -inf value
+    for (int t = threadIdx.x; t < ntiles; t += blockDim.x) {
+        used[t] = 0;
+    }
+    __syncthreads();
+    for (int idx = threadIdx.x; idx < ntiles*(TK/8); idx += blockDim.x) {
+        const int t = idx / (TK/8), c = idx % (TK/8);
+        bool u = false;
+        for (int tok = 0; tok < n_tok && !u; ++tok) {
+            const uint4 v = *(const uint4 *)(mask + tok*nbm1 + (int64_t)(t*TK + 8*c)*2);
+            const uint32_t w[4] = { v.x, v.y, v.z, v.w };
+#pragma unroll
+            for (int k = 0; k < 4; ++k) {
+                u |= (w[k] & 0xFFFFu) != 0xFC00u || (w[k] >> 16) != 0xFC00u;
+            }
+        }
+        if (u) {
+            used[t] = 1;   // benign race: every writer writes 1
+        }
+    }
+    __syncthreads();
+    if (threadIdx.x < 32) {
+        const int lane = threadIdx.x;
+        int32_t * out = list + (int64_t)(strm*nhalf + hf)*tstride;
+        int n = 0;
+        for (int base = 0; base < ntiles; base += 32) {
+            const int t = base + lane;
+            const bool u = t < ntiles && used[t];
+            const unsigned int bal = __ballot_sync(0xffffffff, u);
+            if (u) {
+                out[n + __popc(bal & ((1u << lane) - 1u))] = t;
+            }
+            n += __popc(bal);
+        }
+        if (lane == 0) {
+            count[strm*nhalf + hf] = n;
+        }
+    }
+}
+
 // G: GQA ratio (query heads per KV head); rows r < n_tok*G are real: token r/G, head kvh*G + r%G.
 // 9 to 16 tokens run as nhalf = 2 blocks per (KV head, split), blockIdx.x = half + nhalf*(kvh + n_kv_heads*split): block
 // half takes tokens 8*half .. 8*half + 7 (its own 8-row tile, exactly as an 8-token call of the same split computes them), and the
@@ -136,7 +190,8 @@ __global__ void __launch_bounds__(NTH, 1) verify_stream(
         const int n_tok_all, const int n_head, const int n_kv_heads,
         const int64_t nbq1, const int64_t nbq2, const int64_t nbk1, const int64_t nbk2, const int64_t nbv1, const int64_t nbv2,
         const int64_t nbm1, const int n_kv, const int32_t * __restrict__ kv_count, const int nsplit, const float qscale, const int nhalf,
-        const int64_t nbq3, const int64_t nbk3, const int64_t nbv3, const int64_t nbm3) {
+        const int64_t nbq3, const int64_t nbk3, const int64_t nbv3, const int64_t nbm3,
+        const int32_t * __restrict__ tlist, const int32_t * __restrict__ tcount, const int tstride) {
 #if __CUDA_ARCH__ == 700
     static_assert(G >= NR/8 && G <= 8, "the mask tile holds 8 tokens");
     constexpr float LOG2E = 1.4426950408889634f;
@@ -176,10 +231,14 @@ __global__ void __launch_bounds__(NTH, 1) verify_stream(
     }
     const int kvh   = bxk % n_kv_heads;
     const int split = bxk / n_kv_heads;
-    const int ntiles = n_kv_used / TK;
+    // [TAG_FVS_SKIP] with a list, the splits divide this half's used tiles (tiles_used); tile k of the split is tl[k]
+    const int32_t * tl = tlist ? tlist + (int64_t)(strm*nhalf + hf)*tstride : nullptr;
+    const int ntiles = tl ? tcount[strm*nhalf + hf] : n_kv_used / TK;
     const int it0 = (int)(((int64_t) split     *ntiles)/nsplit);
     const int it1 = (int)(((int64_t)(split + 1)*ntiles)/nsplit);
     const int nt  = it1 - it0;
+    // the first key of the split's tile k (0 <= k < nt)
+    auto key0 = [&](int k) -> int64_t { return (int64_t)(tl ? tl[it0 + k] : it0 + k)*TK; };
     const int nrows = n_tok*G;
 
     // Q -> f16, scaled; padded rows are zero
@@ -198,7 +257,7 @@ __global__ void __launch_bounds__(NTH, 1) verify_stream(
     if (tid < 64 && nt > 0) {
         const int tok = tid >> 3, c = tid & 7;
         uint4 mv = make_uint4(0, 0, 0, 0);
-        if (tok < n_tok) mv = *(const uint4 *)(mask + tok*nbm1 + (int64_t)(it0*TK + 8*c)*2);
+        if (tok < n_tok) mv = *(const uint4 *)(mask + tok*nbm1 + (key0(0) + 8*c)*2);
         *(uint4 *) &s.M[0][tok*MST + 8*c] = mv;
     }
     if (tid < NR) {
@@ -229,14 +288,14 @@ __global__ void __launch_bounds__(NTH, 1) verify_stream(
             for (int j = 0; j < 4; ++j) { mrun[t][j] = -INFINITY; lrun[t][j] = 0.0f; }
         if (KQ > 0 && nt > 0) {
             {
-                const char * kp = Kbase + (int64_t)(it0*TK + w)*nbk1 + kofs;
+                const char * kp = Kbase + (key0(0) + w)*nbk1 + kofs;
 #pragma unroll
                 for (int rr = 0; rr < KQ; ++rr, kp += 4*nbk1) kreg[rr] = ld_row8<KVQ8, Q8W>(kp, kq);
             }
 #pragma unroll
             for (int rr = 0; rr < KQ; ++rr) *(uint4 *) &s.K[(4*rr + w)*KST + 8*lane] = to_f16x8<KVQ8>(kreg[rr]);
             if (nt > 1) {
-                const char * kp = Kbase + (int64_t)((it0 + 1)*TK + w)*nbk1 + kofs;
+                const char * kp = Kbase + (key0(1) + w)*nbk1 + kofs;
 #pragma unroll
                 for (int rr = 0; rr < KQ; ++rr, kp += 4*nbk1) kreg[rr] = ld_row8<KVQ8, Q8W>(kp, kq);
             }
@@ -250,7 +309,7 @@ __global__ void __launch_bounds__(NTH, 1) verify_stream(
                 uint4 mnext = make_uint4(0, 0, 0, 0);
                 const bool has_next = j + 1 < nt;
                 if (tid < 64 && has_next && (tid >> 3) < n_tok) {
-                    mnext = *(const uint4 *)(mask + (tid >> 3)*nbm1 + ((int64_t)(it0 + j + 1)*TK + 8*(tid & 7))*2);
+                    mnext = *(const uint4 *)(mask + (tid >> 3)*nbm1 + (key0(j + 1) + 8*(tid & 7))*2);
                 }
 
                 // ---- S = K Q^T for 32 keys x 24 rows, two accumulator sets over the dims
@@ -359,7 +418,7 @@ __global__ void __launch_bounds__(NTH, 1) verify_stream(
                     for (int rr = 0; rr < KQ; ++rr) *(uint4 *) &s.K[(4*rr + w)*KST + 8*lane] = to_f16x8<KVQ8>(kreg[rr]);
                     if (tid < 64) *(uint4 *) &s.M[b ^ 1][(tid >> 3)*MST + 8*(tid & 7)] = mnext;
                     if (KQ > 0 && j + 2 < nt) {
-                        const char * kp = Kbase + (int64_t)((it0 + j + 2)*TK + w)*nbk1 + kofs;
+                        const char * kp = Kbase + (key0(j + 2) + w)*nbk1 + kofs;
 #pragma unroll
                         for (int rr = 0; rr < KQ; ++rr, kp += 4*nbk1) kreg[rr] = ld_row8<KVQ8, Q8W>(kp, kq);
                     }
@@ -409,7 +468,7 @@ __global__ void __launch_bounds__(NTH, 1) verify_stream(
 #pragma unroll
                 for (int i = 0; i < 8; ++i) O[u][t][i] = 0.0f;
         if (nt > 0) {
-            const char * vp = Vbase + (int64_t)(it0*TK)*nbv1;
+            const char * vp = Vbase + key0(0)*nbv1;
 #pragma unroll
             for (int q = 0; q < 16; ++q, vp += 4*nbv1) vreg[q] = ld_row8<KVQ8, Q8W>(vp, vq);
         }
@@ -417,14 +476,14 @@ __global__ void __launch_bounds__(NTH, 1) verify_stream(
             const int wk = w & 3;
             if (nt > 0) {
                 {
-                    const char * kp = Kbase + (int64_t)(it0*TK + wk + 4*KQ)*nbk1 + kofs;
+                    const char * kp = Kbase + (key0(0) + wk + 4*KQ)*nbk1 + kofs;
 #pragma unroll
                     for (int rr = 0; rr < KP; ++rr, kp += 4*nbk1) kreg[rr] = ld_row8<KVQ8, Q8W>(kp, kq);
                 }
 #pragma unroll
                 for (int rr = 0; rr < KP; ++rr) *(uint4 *) &s.K[(4*(KQ + rr) + wk)*KST + 8*lane] = to_f16x8<KVQ8>(kreg[rr]);
                 if (nt > 1) {
-                    const char * kp = Kbase + (int64_t)((it0 + 1)*TK + wk + 4*KQ)*nbk1 + kofs;
+                    const char * kp = Kbase + (key0(1) + wk + 4*KQ)*nbk1 + kofs;
 #pragma unroll
                     for (int rr = 0; rr < KP; ++rr, kp += 4*nbk1) kreg[rr] = ld_row8<KVQ8, Q8W>(kp, kq);
                 }
@@ -452,7 +511,7 @@ __global__ void __launch_bounds__(NTH, 1) verify_stream(
                 }
                 // O^T += V^T P^T for 64 dims x 48 rows over the tile's 64 keys; V of the next tile is requested as this one is consumed
                 const bool has_next = j < nt;
-                const char * vp = Vbase + (int64_t)((it0 + j)*TK)*nbv1;
+                const char * vp = Vbase + (has_next ? key0(j) : 0)*nbv1;
 #ifndef FVS_SKIP_PV
 #pragma unroll
                 for (int c = 0; c < TK/8; ++c) {
@@ -480,7 +539,7 @@ __global__ void __launch_bounds__(NTH, 1) verify_stream(
 #pragma unroll
                     for (int rr = 0; rr < KP; ++rr) *(uint4 *) &s.K[(4*(KQ + rr) + wk)*KST + 8*lane] = to_f16x8<KVQ8>(kreg[rr]);
                     if (j + 2 < nt) {
-                        const char * kp = Kbase + (int64_t)((it0 + j + 2)*TK + wk + 4*KQ)*nbk1 + kofs;
+                        const char * kp = Kbase + (key0(j + 2) + wk + 4*KQ)*nbk1 + kofs;
 #pragma unroll
                         for (int rr = 0; rr < KP; ++rr, kp += 4*nbk1) kreg[rr] = ld_row8<KVQ8, Q8W>(kp, kq);
                     }
@@ -511,7 +570,7 @@ __global__ void __launch_bounds__(NTH, 1) verify_stream(
 #else
     (void) Q; (void) K; (void) V; (void) mask; (void) dst; (void) parts; (void) meta; (void) n_tok_all; (void) n_head; (void) n_kv_heads;
     (void) nbq1; (void) nbq2; (void) nbk1; (void) nbk2; (void) nbv1; (void) nbv2; (void) nbm1; (void) n_kv; (void) kv_count; (void) nsplit; (void) qscale; (void) nhalf;
-    (void) nbq3; (void) nbk3; (void) nbv3; (void) nbm3;
+    (void) nbq3; (void) nbk3; (void) nbv3; (void) nbm3; (void) tlist; (void) tcount; (void) tstride;
 #endif // __CUDA_ARCH__ == 700
 }
 } // namespace fvs
