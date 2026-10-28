@@ -69,21 +69,26 @@ Against upstream at `403f06f`, one line each. The design, the measurements and t
 
 | BetterBench | Upstream, f16 KV, 2 × 49,152 | This fork, `q8_0` KV, 4 slots on 262,144 |
 |---|---|---|
-| Time to first token, single stream (p50) | 610 ms | 191 ms |
-| Cold prefill, 12k / 24k / 47k-token prompts | 877 / 858 / 795 tok/s | 938 / 894 / 816 tok/s |
-| Aggregate decode, 1 / 2 / 4 requests in flight* | 90 / 101 / 89 tok/s | 91 / 114 / 151 tok/s |
-| Time to first token with 2 / 4 in flight (p50) | 2.3 s / 12.1 s | 0.31 s / 0.41 s |
-| Single-stream decode (weighted median)* | 108.9 tok/s at temperature 0.7 | 101.4 tok/s at temperature 1.0 |
-| Peak VRAM over the run | 31,044 MiB at 98,304 tokens | 32,296 MiB at 262,144 tokens |
+| Context | 2 slots of 49,152 tokens (98,304 in all) | 4 slots sharing one 262,144-token pool |
+| Time to first token, single stream (p50) | 610 ms | 197 ms |
+| Single-stream decode (weighted median)* | 108.9 tok/s at temperature 0.7 | 106.2 tok/s at temperature 1.0 |
+| Single-stream decode, median of 160 runs* | — | 112.1 tok/s |
+| Cold prefill, 1.5k / 6k / 12k / 24k / 47k-token prompts | 785 / 856 / 877 / 858 / 795 tok/s | 952 / 978 / 942 / 896 / 815 tok/s |
+| Aggregate decode, 1 / 2 / 4 requests in flight* | 90 / 101 / 89 tok/s | 89 / 112 / 155 tok/s |
+| Per-request decode, 1 / 2 / 4 requests in flight (median)* | 130 / 102 / 123 tok/s | 116 / 66 / 48 tok/s |
+| Time to first token, 1 / 2 / 4 requests in flight (p50) | 0.66 / 2.26 / 12.07 s | 0.19 / 0.31 / 0.37 s |
+| Peak VRAM | 31,044 MiB at 98,304 tokens | 32,260 MiB at 262,144 tokens (production, under agents) |
 
 \* The decode rows are not like for like: decode follows how many draft tokens are accepted, which falls as the
 temperature rises, and upstream ran at 0.7. Under upstream's conditions (temperature 0.7, the 47k-token conversation
 resident), a lone stream decodes 3% slower here, the cost of the 8-bit cache, and four requests in flight give 158 tok/s
-against 89. Prefill and the time to the first token do not depend on the temperature.
+against 89. Prefill and the time to the first token do not depend on the temperature. Upstream's per-request decode stays
+high with four requests because its two slots serve them two at a time: each decodes almost alone, after waiting up to
+12 s to start.
 
-The first token comes three times sooner, prompts are read 3–7% faster, the context is 2.7× larger, and with four
-requests in flight the fork serves 1.7× the throughput, the fourth request starting in 0.4 s instead of 12 s (upstream's
-two slots serve four requests two at a time). The 262,144-token pool peaks at ~32.3 GB of the card's 32.5 over the run.
+The first token comes three times sooner, prompts are read 3–21% faster (the most for short ones), the context is 2.7×
+larger, and with four requests in flight the fork serves 1.7× the throughput, the fourth request starting in 0.4 s
+instead of 12 s. The 262,144-token pool peaks at ~32.3 GB of the card's 32.5 in production under four agents.
 
 What the bench does not show, because its conversations are short and never return:
 
