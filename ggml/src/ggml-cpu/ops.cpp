@@ -8772,8 +8772,11 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
     ggml_vec_dot_t    const kq_vec_dot     = ggml_get_type_traits_cpu(k->type)->vec_dot;
     ggml_to_float_t   const v_to_float     = ggml_get_type_traits(v->type)->to_float;
 
-    // the banded op saturates an unnormalized FP16 VKQ accumulator, keep it in FP32
-    const bool vkq_f16 = v->type == GGML_TYPE_F16 && rel == nullptr;
+    // the banded op saturates an unnormalized FP16 VKQ accumulator, keep it in FP32, and so does a long context: each key's
+    // product is rounded into the FP16 sum, an error that grows with the keys. test-backend-ops, the 27B's prompt call on
+    // the V100 against the FP16 sum: 0.00016 at 8,192 keys, 0.0013 at 65,536, 0.0054 at 262,144 (its limit is 0.0005);
+    // against an FP32 sum the same GPU results are within 0.0000001 at every length
+    const bool vkq_f16 = v->type == GGML_TYPE_F16 && rel == nullptr && nek1 <= 8192;
 
     GGML_ASSERT((                            q_to_vec_dot) && "fattn: unsupported K-type");
     GGML_ASSERT((v->type == GGML_TYPE_F32 || v_to_float  ) && "fattn: unsupported V-type");
