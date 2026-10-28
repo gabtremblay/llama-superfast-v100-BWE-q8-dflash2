@@ -93,8 +93,9 @@ What the bench does not show, because its conversations are short and never retu
 - **Four long conversations generating together.** Four ~30k-token conversations in the pool decode 151 tok/s
   combined, at 76.6 ms a joint step ([§18](CHANGES.md#18-four-agents-at-once-packs-that-pay-the-joint-steps-empty-tiles-image-prompts-as-jobs)).
 - **A conversation that comes back.** One that left its slot is restored from the host prompt cache in 0.97 s for 24k
-  tokens over this link, against a re-read of 26 s; the save costs ~0.64 s for 47k tokens when it leaves
-  ([§16](CHANGES.md#16-the-prompt-cache-gives-back-the-conversations-that-left-the-slots)).
+  tokens over this link, against a re-read of 26 s; when it is cleared for room, its save runs in the background, ~35 ms of
+  the server's time ([§16](CHANGES.md#16-the-prompt-cache-gives-back-the-conversations-that-left-the-slots),
+  [§20](CHANGES.md#20-a-conversation-cleared-for-room-is-saved-in-the-background)).
 
 ## Build
 
@@ -173,8 +174,9 @@ What the settings do:
 - `--cache-ram 15360 --no-cache-idle-slots` ([§16](CHANGES.md#16-the-prompt-cache-gives-back-the-conversations-that-left-the-slots)): a host prompt cache of
   15 GiB for the conversations that leave the slots. **`--cache-ram 15360` is sized for a host with 32 GB of RAM; with
   less, lower it.** One cleared from the pool for a bigger prompt, or replaced in its slot, is restored when it comes
-  back: 0.97 s for 24k tokens over this link, against a re-read of 26 s. The save pauses the server once, ~0.64 s for
-  47k tokens; conversations under 8,192 tokens are not saved (`LLAMA_CACHE_MIN_TOKENS`), an entry keeps its
+  back: 0.97 s for 24k tokens over this link, against a re-read of 26 s. One cleared for room is saved in the background
+  (~35 ms of the server's time, [§20](CHANGES.md#20-a-conversation-cleared-for-room-is-saved-in-the-background)); one
+  replaced in its slot pauses the server once, ~0.64 s for 47k tokens; conversations under 8,192 tokens are not saved (`LLAMA_CACHE_MIN_TOKENS`), an entry keeps its
   conversation's newest two checkpoints (`LLAMA_CACHE_CKPT_KEEP`), and the cache drops its oldest entries to keep
   4 GiB of the host's memory available whatever its limit (`LLAMA_CACHE_RESERVE_MIB`). Without
   `--no-cache-idle-slots` the server saves and clears every idle slot at every new task. `--cache-ram 0` turns the
@@ -274,7 +276,9 @@ LLAMA_DFLASH2_HEAD_FILE=models/mtp-Qwen3.8-27B-Q4_0.gguf LLAMA_SPEC_DRAFT_VOCAB_
 - The checkpoint pool and the prompt cache live in host memory: ~10 GB pinned and up to 15 GiB with the Run line, on a
   32 GB host. A restart loses every cached conversation, so the next prompt of a long conversation is read in full (a
   190k-token conversation took 6 minutes).
-- The cache's save copies a conversation that leaves its slot while every slot waits, ~0.64 s for 47k tokens.
+- A conversation replaced in its slot, or cleared to make room for a restore, is saved while every slot waits, ~0.64 s
+  for 47k tokens, and a restore holds them ~0.8-1 s for 20k tokens; only one cleared for a new prompt is saved in the
+  background.
 - A prompt that cannot fit the pool beside the other conversations is refused at once with the context-size error
   ([§17](CHANGES.md#17-a-full-pool-the-slot-kept-the-prompt-that-cannot-fit-refused-room-made-for-a-restore)):
   the client has to compact it or wait. Idle conversations are cleared for it first, a longer one only once the prompt

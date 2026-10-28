@@ -433,3 +433,41 @@ Measured on the dev build (65,536-token pool):
 | A fragmented pack (`kvfrag_eq.py`, three conversations generating together) | 357 runs, 35,597 cells in 16 ms, queued in 0.06 ms; every moved conversation's 48 greedy tokens identical to a fresh read |
 | `LLAMA_KV_MOVE_VERIFY=1` on every pack and compaction of the probes | identical, byte for byte |
 | Three idle conversations of 20k, 19k and 18k tokens, a new 15k one (`kvadmit2_probe.py`, cache 15 GiB) | the new one admitted, the 20k one saved and cleared, and back from the cache when it returns (20,015 tokens cached, 63 read, 1.6 s) |
+
+## 20. A conversation cleared for room is saved in the background
+
+A conversation cleared to make room (the idle ones of section 19) went to the prompt cache while every slot waited: the
+device stopped, then one blocking copy per layer and cell range into pageable memory, after a zero-filled allocation and
+a copy of its checkpoints. Measured on the dev build, a 20k-token conversation held the server 633 ms (allocation 178,
+state 289, checkpoints 166), a fragmented 13k-token one ~800 ms, of which the draft's 40 MiB took 247 ms; production saw
+1.29 s and 2.83 s.
+
+- **The copy on a stream of its own.** `llama_state_seq_get_data_bg` writes the header and the cells' metadata at once,
+  records an event on the compute stream and hands the tensor ranges to a worker thread, which waits for that event on
+  its own stream, then per chunk of at most 32 MiB gathers the chunk's ranges into a device staging half in one launch
+  (`ggml_backend_cuda_gather_bytes`), sends it to a pinned host half, and copies it into the entry while the other half's
+  chunk crosses the link. The saver costs 2 x 32 MiB of the card's memory and 2 x 32 MiB of pinned host memory, made on
+  the first save and shared by the target's and the draft's contexts. `llama_state_seq_bg_poll` reports the copy done.
+- **The slot held until it is done.** The cleared conversation's slot keeps its cells and takes no task, pack or clearing
+  while its copy runs (`held()`); its cache entry is `busy` (not loaded, dropped or reused). The prompt that needs the
+  room waits for it, not refused, and every other slot goes on. Each round polls the copies; a finished one makes the
+  entry usable and clears the slot (a failed one drops the entry).
+- **Nothing zeroed, nothing copied twice.** An entry's buffers are no longer zero-filled (the worker's writes take the
+  page faults), and its newest checkpoints move into it instead of being copied, the slot being cleared after.
+- `LLAMA_CACHE_BG_SAVE=0` saves synchronously as before; `LLAMA_CACHE_BG_VERIFY=1` compares each background save with a
+  synchronous save of the same, untouched cells (it stops the device: for tests). A save logs its main-thread time
+  (`prompt saving in the background`), the copy its throughput (`state of ticket`).
+
+Still synchronous: the save when a task replaces an idle slot's conversation in that slot, the clearing that makes room
+for a restore, and the restore itself (~0.8-1 s for 20k tokens).
+
+Measured on the dev build (65,536-token pool, cache 15 GiB):
+
+| Case | Main thread, before | Main thread, after | Copy (background) |
+|---|---|---|---|
+| A 20k-token conversation cleared for a new prompt (`kvadmit2_probe.py`) | 420 ms | ~35 ms (66 ms on the first save, which makes the saver) | 815 MiB in 360 ms, 2.4 GB/s |
+| A fragmented 13k-token one (`kvfrag_eq.py`, 9,920 ranges) | ~800 ms | ~35 ms | 589 MiB in 222 ms, 2.8 GB/s |
+| Its draft state alone | 247 ms | 4 ms | 40 MiB, behind the target's copy |
+
+Every background save of the probes was identical, target and draft, to a synchronous save of the same cells, and the
+cleared conversation came back from the cache when it returned.
