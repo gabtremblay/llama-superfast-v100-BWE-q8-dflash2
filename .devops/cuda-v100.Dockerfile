@@ -19,7 +19,7 @@ ARG BASE_IMAGE=nvidia/cuda:${CUDA_VERSION}-devel-ubuntu${UBUNTU_VERSION}
 ARG RUNTIME_IMAGE=nvidia/cuda:${CUDA_VERSION}-runtime-ubuntu${UBUNTU_VERSION}
 FROM ${BASE_IMAGE} AS build
 
-ARG LLAMA_REPO=https://github.com/gabtremblay/llama-superfast-v100-BWE-q8-dflash2.git
+ARG LLAMA_REPO=https://github.com/inscora/llama-superfast-v100-BWE-q8-dflash2.git
 ARG LLAMA_REF=main
 
 # 70-real = sm_70 SASS only: no PTX, no JIT. Never "native": no GPU is visible in a docker build.
