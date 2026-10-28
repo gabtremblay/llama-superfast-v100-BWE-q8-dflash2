@@ -2838,7 +2838,7 @@ bool llama_context::kv_compact_seq(llama_seq_id seq_id, uint32_t n_next) {
         const char * e = getenv("LLAMA_KV_COMPACT_PROMPT_MAX");
         return e ? (uint32_t) std::max(0, atoi(e)) : UINT32_MAX;
     }();
-    return kv != nullptr && max_cells > 0 && kv->seq_compact(seq_id, n_next, [this] { synchronize(); }, max_cells);
+    return kv != nullptr && max_cells > 0 && kv->seq_compact(seq_id, n_next, [this] { synchronize(); }, max_cells, kv_move_backend());
 }
 
 // [TAG_KV_PACK] the room the server's two-step pack would give `target`, without moving anything
@@ -2869,16 +2869,18 @@ uint32_t llama_context::kv_pack_seqs(const llama_seq_id * seqs, size_t n) {
     if (kv == nullptr) {
         return 0;
     }
-    // the device backend for the row copies (one card; a split cache moves its rows device by device, synchronously)
-    ggml_backend_t be = nullptr;
+    return kv->seqs_pack(std::vector<llama_seq_id>(seqs, seqs + n), [this] { synchronize(); }, kv_move_backend());
+}
+
+// the device backend for the row copies (one card; a split cache moves its rows device by device, synchronously)
+ggml_backend_t llama_context::kv_move_backend() const {
     for (auto & b : backends) {
         ggml_backend_dev_t dev = ggml_backend_get_device(b.get());
         if (dev != nullptr && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
-            be = b.get();
-            break;
+            return b.get();
         }
     }
-    return kv->seqs_pack(std::vector<llama_seq_id>(seqs, seqs + n), [this] { synchronize(); }, be);
+    return nullptr;
 }
 
 // [TAG_KV_ADMIT]
@@ -3408,7 +3410,7 @@ void llama_context::kv_compact(const llama_batch & b) {
         kv = dynamic_cast<llama_kv_cache *>(memory.get());
     }
     if (kv != nullptr) {
-        kv->seq_compact(s0, (uint32_t) b.n_tokens, [this] { synchronize(); });
+        kv->seq_compact(s0, (uint32_t) b.n_tokens, [this] { synchronize(); }, 0, kv_move_backend());
     }
 }
 

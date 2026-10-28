@@ -1546,7 +1546,8 @@ uint32_t llama_kv_cache::seq_room(llama_seq_id seq_id) const {
 // [TAG_KV_COMPACT] a new conversation in a unified cache keeps the cells of the prefix it restored (a shared system prompt), which sat
 // before the other slot's conversation: with no room after them, its prompt went past the other conversation, and every window of it
 // spanned that conversation's cells, masked but read (a 47k-token prompt beside a 47k-token resident conversation)
-bool llama_kv_cache::seq_compact(llama_seq_id seq_id, uint32_t n_next, const std::function<void()> & sync, uint32_t max_cells) {
+bool llama_kv_cache::seq_compact(llama_seq_id seq_id, uint32_t n_next, const std::function<void()> & sync, uint32_t max_cells,
+        ggml_backend_t backend) {
     static const uint32_t max_cells_env = [] {
         const char * e = getenv("LLAMA_KV_COMPACT_MAX");
         return e ? (uint32_t) std::max(0, atoi(e)) : 1024u;
@@ -1598,8 +1599,24 @@ bool llama_kv_cache::seq_compact(llama_seq_id seq_id, uint32_t n_next, const std
 
     std::sort(idx.begin(), idx.end(), [&](uint32_t a, uint32_t b) { return cells.pos_get(a) < cells.pos_get(b); });
 
+    // [TAG_KV_MOVE] the destination run is free, so no move overlaps a source: with the kernel the rows move on the backend's
+    // stream, after every graph queued there and before every graph queued after, without stopping it (in production the
+    // compaction before a 25k-token conversation's next prompt held every slot 1.0 s)
+    std::vector<pack_move> runs;
+    for (size_t j = 0; j < idx.size(); ) {
+        size_t n = 1;
+        while (j + n < idx.size() && idx[j + n] == idx[j] + n) {
+            ++n;
+        }
+        runs.push_back({ idx[j], best + (uint32_t) j, (uint32_t) n });
+        j += n;
+    }
+    const bool on_device = move_rows_device(backend, runs, "compact");
+
     // no decode may be reading or writing the cache while its rows move
-    sync();
+    if (!on_device) {
+        sync();
+    }
     auto move_rows = [&](ggml_tensor * t) {
         for (size_t j = 0; j < idx.size(); ) {
             size_t n = 1;
@@ -1617,6 +1634,9 @@ bool llama_kv_cache::seq_compact(llama_seq_id seq_id, uint32_t n_next, const std
         }
     };
     for (auto & layer : layers) {
+        if (on_device) {
+            break;
+        }
         for (ggml_tensor * t : { layer.k_stream[0], layer.v_stream[0] }) {
             if (t == nullptr) {
                 continue;
@@ -1767,6 +1787,88 @@ uint32_t llama_kv_cache::seqs_pack_room(const std::vector<llama_seq_id> & first,
     return room;
 }
 
+// [TAG_KV_MOVE] four slots generating at once interleave their conversations' cells in short runs, and a pack of them was
+// thousands of runs, two copies a run through the scratch for each layer's K and V: in production 61,904 cells took 1,056 ms
+// of host time while every slot waited, where 58,379 cells in long runs took 33 ms. One launch walks the moves in order
+// instead. LLAMA_KV_MOVE_VERIFY=1 compares the first and the last tensor's moved rows with their sources byte for byte (it
+// stops the stream before and after: for tests)
+bool llama_kv_cache::move_rows_device(ggml_backend_t backend, const std::vector<pack_move> & moves, const char * what) {
+    static const bool enabled = [] { const char * e = getenv("LLAMA_KV_MOVE_KERNEL"); return e == nullptr || atoi(e) != 0; }();
+    static const bool verify  = [] { const char * e = getenv("LLAMA_KV_MOVE_VERIFY"); return e != nullptr && atoi(e) != 0; }();
+    if (!enabled || backend == nullptr || moves.empty() || n_stream != 1 || v_trans) {
+        return false;
+    }
+    std::vector<ggml_tensor *> tensors;
+    for (auto & layer : layers) {
+        for (ggml_tensor * t : { layer.k_stream[0], layer.v_stream[0] }) {
+            if (t == nullptr) {
+                continue;
+            }
+            if (ggml_backend_meta_buffer_n_simple(t->buffer) != 0) {
+                return false; // a split cache: its rows move device by device
+            }
+            tensors.push_back(t);
+        }
+    }
+    if (tensors.empty()) {
+        return false;
+    }
+    if (!kvmove_looked) {
+        kvmove_looked = true;
+        ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+        if (dev != nullptr) {
+            kvmove_fn = ggml_backend_reg_get_proc_address(ggml_backend_dev_backend_reg(dev), "ggml_backend_cuda_kv_move_rows");
+        }
+    }
+    if (kvmove_fn == nullptr) {
+        return false;
+    }
+    typedef bool (*kvmove_fn_t)(ggml_backend_t, ggml_tensor * const *, int, const uint32_t *, int);
+    static_assert(sizeof(pack_move) == 3*sizeof(uint32_t), "pack_move is the kernel's [src, dst, n]");
+
+    uint64_t n_rows = 0;
+    for (const pack_move & m : moves) {
+        n_rows += m.n;
+    }
+    // the sources' bytes of the first and the last tensor, before any row moves
+    ggml_tensor * vt[2] = { tensors.front(), tensors.back() };
+    std::vector<uint8_t> want[2];
+    if (verify) {
+        ggml_backend_synchronize(backend);
+        for (int k = 0; k < 2; ++k) {
+            for (const pack_move & m : moves) {
+                const size_t at = want[k].size();
+                want[k].resize(at + (size_t) m.n*vt[k]->nb[1]);
+                ggml_backend_tensor_get(vt[k], want[k].data() + at, (size_t) m.src*vt[k]->nb[1], (size_t) m.n*vt[k]->nb[1]);
+            }
+        }
+    }
+    const int64_t t0 = ggml_time_us();
+    if (!((kvmove_fn_t) kvmove_fn)(backend, tensors.data(), (int) tensors.size(), (const uint32_t *) moves.data(), (int) moves.size())) {
+        return false;
+    }
+    LLAMA_LOG_WARN("%s: %s: %zu runs, %llu rows of %zu tensors queued in one launch in %.2f ms (LLAMA_KV_MOVE_KERNEL=0: run by run)\n",
+            __func__, what, moves.size(), (unsigned long long) n_rows, tensors.size(), (ggml_time_us() - t0)/1000.0);
+    if (verify) {
+        ggml_backend_synchronize(backend);
+        size_t bad = 0;
+        std::vector<uint8_t> got;
+        for (int k = 0; k < 2; ++k) {
+            size_t at = 0;
+            for (const pack_move & m : moves) {
+                const size_t sz = (size_t) m.n*vt[k]->nb[1];
+                got.resize(sz);
+                ggml_backend_tensor_get(vt[k], got.data(), (size_t) m.dst*vt[k]->nb[1], sz);
+                bad += memcmp(got.data(), want[k].data() + at, sz) != 0;
+                at  += sz;
+            }
+        }
+        LLAMA_LOG_WARN("%s: %s: verify, %zu runs of 2 tensors: %s (%zu runs differ)\n", __func__, what, moves.size(),
+                bad == 0 ? "identical" : "MISMATCH", bad);
+    }
+    return true;
+}
+
 uint32_t llama_kv_cache::seqs_pack(const std::vector<llama_seq_id> & seqs, const std::function<void()> & sync, ggml_backend_t backend) {
     if (!kv_window || n_stream != 1 || v_trans || seqs.empty()) {
         return 0;
@@ -1793,9 +1895,12 @@ uint32_t llama_kv_cache::seqs_pack(const std::vector<llama_seq_id> & seqs, const
     if (backend == nullptr || pack_sync) {
         sync();
     }
+    // [TAG_KV_MOVE] one launch for every run and tensor when the device has the kernel; else run by run below
+    const bool on_device = backend != nullptr && move_rows_device(backend, moves, "pack");
     // with a backend, a range goes through the device scratch in two copies of up to the scratch's size, whatever its
-    // distance (chunked by the distance, a 23.7k-cell move by a few cells was thousands of tiny copies: 0.5 s); without
-    // one (a split cache), the chunks are no longer than the distance and each copy is synchronous
+    // distance (chunked by the distance, a 23.7k-cell move by a few cells was thousands of tiny copies: 0.5 s), unless it
+    // does not overlap its destination: then one copy; without one (a split cache), the chunks are no longer than the
+    // distance and each copy is synchronous
     const size_t scratch_bytes = 64ull << 20;
     auto move_rows = [&](ggml_tensor * t, ggml_backend_t be) {
         if (be != nullptr && !pack_scratch) {
@@ -1803,8 +1908,9 @@ uint32_t llama_kv_cache::seqs_pack(const std::vector<llama_seq_id> & seqs, const
         }
         const bool via_scratch = be != nullptr && pack_scratch && t->nb[1] > 0 && (size_t) t->nb[1] <= scratch_bytes;
         for (const move_t & m : moves) {
-            const uint32_t gap = m.src - m.dst;
-            const uint32_t cap = via_scratch ? (uint32_t) std::min<size_t>(UINT32_MAX, scratch_bytes / t->nb[1]) : gap;
+            const uint32_t gap    = m.src - m.dst;
+            const bool     direct = gap >= m.n; // the destination does not overlap the source
+            const uint32_t cap    = direct ? m.n : via_scratch ? (uint32_t) std::min<size_t>(UINT32_MAX, scratch_bytes / t->nb[1]) : gap;
             for (uint32_t off = 0; off < m.n; ) {
                 const uint32_t n = std::min(cap, m.n - off);
                 ggml_tensor s = *t;
@@ -1813,7 +1919,7 @@ uint32_t llama_kv_cache::seqs_pack(const std::vector<llama_seq_id> & seqs, const
                 s.view_src = t->view_src ? t->view_src : t;
                 ggml_tensor d = s;
                 d.data     = (char *) t->data + (size_t) (m.dst + off)*t->nb[1];
-                if (via_scratch) {
+                if (via_scratch && !direct) {
                     ggml_tensor x = s;
                     x.buffer   = pack_scratch.get();
                     x.data     = ggml_backend_buffer_get_base(pack_scratch.get());
@@ -1830,6 +1936,9 @@ uint32_t llama_kv_cache::seqs_pack(const std::vector<llama_seq_id> & seqs, const
         }
     };
     for (auto & layer : layers) {
+        if (on_device) {
+            break;
+        }
         for (ggml_tensor * t : { layer.k_stream[0], layer.v_stream[0] }) {
             if (t == nullptr) {
                 continue;
@@ -1851,6 +1960,9 @@ uint32_t llama_kv_cache::seqs_pack(const std::vector<llama_seq_id> & seqs, const
                 move_rows(td, nullptr);
             }
         }
+    }
+    if (!on_device) {
+        LLAMA_LOG_WARN("%s: %zu runs copied run by run%s\n", __func__, moves.size(), backend == nullptr ? ", synchronously" : "");
     }
     if (backend != nullptr && pack_sync) {
         ggml_backend_synchronize(backend);

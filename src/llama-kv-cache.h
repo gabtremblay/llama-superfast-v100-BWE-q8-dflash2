@@ -184,7 +184,10 @@ public:
     // the largest free run that holds them and the ubatch, so find_slot places the ubatch right after them and the sequence's
     // window does not span the cells between. Returns true if it moved them
     // max_cells overrides LLAMA_KV_COMPACT_MAX for this call (a prompt's start moves its whole cached prefix: a copy of a few ms once)
-    bool seq_compact(llama_seq_id seq_id, uint32_t n_next, const std::function<void()> & sync, uint32_t max_cells = 0);
+    // backend: the device's, for the rows to move on its stream without stopping it (move_rows_device); nullptr: stop, then a
+    // synchronous copy a run
+    bool seq_compact(llama_seq_id seq_id, uint32_t n_next, const std::function<void()> & sync, uint32_t max_cells = 0,
+            ggml_backend_t backend = nullptr);
 
     // [TAG_KV_PACK] the cells of the given sequences (the idle slots' conversations and the prompt's own) move down over the
     // free cells below them, in order, so the free space becomes one run at the top of the used range; the other sequences'
@@ -205,6 +208,13 @@ public:
     struct pack_move { uint32_t src, dst, n; };
     void seqs_pack_shadow(std::vector<int32_t> & owner) const;
     static void seqs_pack_pass(std::vector<int32_t> & owner, const std::vector<llama_seq_id> & movable, std::vector<pack_move> * moves);
+
+    // [TAG_KV_MOVE] the moves' rows of every layer's K and V in one launch on the backend's stream (ggml_backend_cuda_kv_move_rows),
+    // in order, without stopping it: false when that path is not available (no device backend, a split cache, a backend without
+    // the kernel, moves it does not take, LLAMA_KV_MOVE_KERNEL=0), with nothing moved. what names the caller in the log line
+    bool move_rows_device(ggml_backend_t backend, const std::vector<pack_move> & moves, const char * what);
+    void * kvmove_fn = nullptr; // ggml_backend_cuda_kv_move_rows, looked up on the first move
+    bool   kvmove_looked = false;
 
     // the start of the free run for need cells: the lowest run of need + margin cells, else the largest of at least need; -1 when none
     int64_t free_run_for(const llama_kv_cells & cells, uint32_t need) const;

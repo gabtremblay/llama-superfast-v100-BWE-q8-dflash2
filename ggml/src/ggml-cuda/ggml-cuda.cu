@@ -61,6 +61,7 @@
 #include "ggml-cuda/top-k.cuh"
 #include "ggml-cuda/draft-pick.cuh"
 #include "ggml-cuda/kq-mask.cuh"
+#include "ggml-cuda/kv-move.cuh"
 #include "ggml-cuda/mean.cuh"
 #include "ggml-cuda/tsembd.cuh"
 #include "ggml-cuda/topk-moe.cuh"
@@ -1168,6 +1169,56 @@ static bool ggml_backend_cuda_kq_mask(ggml_backend_t backend, ggml_tensor * mask
     ggml_cuda_set_device(ctx->device);
     ggml_cuda_kq_mask(*ctx, (half *) mask->data, mask->ne[0], (int32_t *) cells->data, kv_size,
             p, py, px, n_tokens, use_2d, upd, upd_lo, upd_n, kv_lo);
+    return true;
+}
+
+// [TAG_KV_MOVE] the KV cache's row moves on the backend's stream, one launch for every tensor and move (see
+// llama_kv_cache::move_rows_device). moves: [n_moves][3] = first source row, first destination row, rows. false, with nothing
+// queued, when a tensor is not a plain buffer on this device or a move is out of range, overlaps its source from above, or
+// writes rows a later move reads (the caller then copies run by run)
+static bool ggml_backend_cuda_kv_move_rows(ggml_backend_t backend, ggml_tensor * const * tensors, int n_tensors,
+        const uint32_t * moves, int n_moves) {
+    if (backend == nullptr || !ggml_backend_is_cuda(backend) || tensors == nullptr || n_tensors <= 0 || moves == nullptr || n_moves < 0) {
+        return false;
+    }
+    ggml_backend_cuda_context * ctx = (ggml_backend_cuda_context *) backend->context;
+    std::vector<kv_move_tensor> desc(n_tensors);
+    int64_t n_rows = INT64_MAX;
+    for (int t = 0; t < n_tensors; ++t) {
+        const ggml_tensor * x = tensors[t];
+        ggml_backend_buffer_t buf = x == nullptr ? nullptr : (x->view_src ? x->view_src->buffer : x->buffer);
+        if (buf == nullptr || !ggml_backend_buffer_is_cuda(buf) || ((ggml_backend_cuda_buffer_context *) buf->context)->device != ctx->device ||
+                x->nb[1] == 0 || x->nb[2] != x->nb[1]*x->ne[1]) {
+            return false;
+        }
+        desc[t] = { (char *) x->data, (uint64_t) x->nb[1] };
+        n_rows  = std::min<int64_t>(n_rows, x->ne[1]);
+    }
+    // a destination below its source, or not overlapping it; destinations in increasing order without overlap (a pack's and a
+    // compaction's are); and no move reads rows an earlier move wrote (the earlier destinations, searched in log time)
+    std::vector<uint32_t> w_lo;
+    std::vector<uint32_t> w_hi;
+    w_lo.reserve(n_moves);
+    w_hi.reserve(n_moves);
+    for (int i = 0; i < n_moves; ++i) {
+        const uint64_t s = moves[3*i + 0];
+        const uint64_t d = moves[3*i + 1];
+        const uint64_t n = moves[3*i + 2];
+        if (n == 0 || s + n > (uint64_t) n_rows || d + n > (uint64_t) n_rows || (d > s && d < s + n) ||
+                (!w_hi.empty() && d < w_hi.back())) {
+            return false;
+        }
+        // the last earlier destination that starts before the source ends
+        const auto it = std::upper_bound(w_lo.begin(), w_lo.end(), (uint32_t) (s + n - 1));
+        if (it != w_lo.begin() && w_hi[(it - w_lo.begin()) - 1] > s) {
+            return false;
+        }
+        w_lo.push_back((uint32_t) d);
+        w_hi.push_back((uint32_t) (d + n));
+    }
+    GGML_RT_SCOPE("cuda.kv_move_rows");
+    ggml_cuda_set_device(ctx->device);
+    ggml_cuda_kv_move_rows(*ctx, desc.data(), n_tensors, moves, n_moves);
     return true;
 }
 
@@ -9388,6 +9439,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_cuda_kq_mask") == 0) {
         return (void *)ggml_backend_cuda_kq_mask;
+    }
+    if (strcmp(name, "ggml_backend_cuda_kv_move_rows") == 0) {
+        return (void *)ggml_backend_cuda_kv_move_rows;
     }
     if (strcmp(name, "ggml_backend_cuda_fattn_stream_limits") == 0) {
         return (void *)ggml_cuda_fattn_verify_stream_limits;
