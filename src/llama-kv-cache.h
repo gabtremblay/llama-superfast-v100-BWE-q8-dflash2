@@ -196,7 +196,8 @@ public:
 
     // [TAG_KV_PACK] the room `target` would have after seqs_pack(first) and then seqs_pack({target}) (the server's two steps;
     // the free cells after its last cell, or the largest free run when it has none), without moving anything; the cache
-    // size when the window placement is off
+    // size when the window placement is off. When the target's cells are all its own, seq_compact can then move them to
+    // the largest free run: that run less the target's cells counts too
     uint32_t seqs_pack_room(const std::vector<llama_seq_id> & first, llama_seq_id target) const;
 
     // the shadow of the cell table the pack plans over (-2 empty, -1 shared by several sequences, else the cell's sequence),

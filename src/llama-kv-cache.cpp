@@ -1731,21 +1731,38 @@ uint32_t llama_kv_cache::seqs_pack_room(const std::vector<llama_seq_id> & first,
             }
         }
     }
-    uint32_t room = 0;
-    if (last >= 0) {
-        for (uint32_t j = (uint32_t) last + 1; j < cells.size() && is_free(j); ++j) {
-            ++room;
-        }
-        return room;
-    }
-    uint32_t run = 0;
+    uint32_t largest = 0;
+    uint32_t run     = 0;
     for (uint32_t j = 0; j <= cells.size(); ++j) {
         if (j < cells.size() && is_free(j)) {
             ++run;
             continue;
         }
-        room = std::max(room, run);
-        run  = 0;
+        largest = std::max(largest, run);
+        run     = 0;
+    }
+    if (last < 0) {
+        return largest;
+    }
+    uint32_t room = 0;
+    for (uint32_t j = (uint32_t) last + 1; j < cells.size() && is_free(j); ++j) {
+        ++room;
+    }
+    // the server compacts the target after the pack when the room after it is short (seq_compact moves a sequence's cells,
+    // none shared, to a free run that holds them and the next tokens): a 3.8k-cell conversation under an idle one it
+    // could not pass had no room after the pack, but 20k free on top; counting only the room after it, the check skipped
+    // the pack and cleared two idle 18k-token conversations instead
+    uint32_t n_target = 0;
+    bool     shared   = false;
+    for (uint32_t j = 0; j < top && !shared; ++j) {
+        if (owner[j] == target) {
+            ++n_target;
+        } else if (owner[j] == -1 && cells.seq_has(j, target)) {
+            shared = true;
+        }
+    }
+    if (!shared && largest > n_target) {
+        room = std::max(room, largest - n_target);
     }
     return room;
 }
