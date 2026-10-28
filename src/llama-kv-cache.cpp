@@ -1661,63 +1661,121 @@ bool llama_kv_cache::seq_compact(llama_seq_id seq_id, uint32_t n_next, const std
 // conversations (a 25k-token prompt with 67k cells free, none of them a run of 41k), and an idle slot's conversation was
 // cleared for it (TAG_KV_EVICT_IDLE): that slot's next prompt re-read 18k tokens beside three generating slots, ~3 minutes.
 // Packing the movable cells down first makes the free space one run for a few ms of row copies
-uint32_t llama_kv_cache::seqs_pack(const std::vector<llama_seq_id> & seqs, const std::function<void()> & sync, ggml_backend_t backend) {
-    if (!kv_window || n_stream != 1 || v_trans || seqs.empty()) {
-        return 0;
-    }
-    auto & cells = v_cells[0];
-    const uint32_t n_cells = cells.size();
-    const uint32_t top     = cells.used_max_p1();
-
-    // the plan over a shadow of the cell table: a cell is empty, fixed, or movable (one of the sequences, not shared)
-    std::vector<uint8_t> occ(top, 0);
+// [TAG_KV_PACK] the shadow of the cell table the pack plans over: -2 empty, -1 shared by several sequences, else the sequence
+void llama_kv_cache::seqs_pack_shadow(std::vector<int32_t> & owner) const {
+    const auto & cells = v_cells[0];
+    const uint32_t top = cells.used_max_p1();
+    owner.assign(top, -2);
     for (uint32_t i = 0; i < top; ++i) {
-        if (cells.is_empty(i)) {
-            continue;
-        }
-        occ[i] = 1;
-        if (cells.seq_count(i) != 1) {
-            continue;
-        }
-        for (llama_seq_id s : seqs) {
-            if (cells.seq_has(i, s)) {
-                occ[i] = 2;
-                break;
-            }
+        if (!cells.is_empty(i)) {
+            owner[i] = cells.seq_count(i) == 1 ? cells.seq_get(i) : -1;
         }
     }
-    struct move_t { uint32_t src, dst, n; };
-    std::vector<move_t> moves;
+}
+
+// one pass of the pack over the shadow: the cells of the movable sequences go to the lowest free cell below them, in order
+void llama_kv_cache::seqs_pack_pass(std::vector<int32_t> & owner, const std::vector<llama_seq_id> & movable, std::vector<pack_move> * moves) {
+    const uint32_t top = (uint32_t) owner.size();
+    auto is_movable = [&](int32_t o) { return o >= 0 && std::find(movable.begin(), movable.end(), o) != movable.end(); };
     uint32_t dst = 0;
     for (uint32_t src = 0; src < top; ++src) {
-        if (occ[src] != 2) {
+        if (!is_movable(owner[src])) {
             continue;
         }
-        while (dst < src && occ[dst] != 0) {
+        while (dst < src && owner[dst] != -2) {
             ++dst;
         }
         if (dst >= src) {
             dst = src + 1; // in place; the next free cell is above it
             continue;
         }
-        occ[dst] = 1;
-        occ[src] = 0;
-        if (!moves.empty() && moves.back().src + moves.back().n == src && moves.back().dst + moves.back().n == dst) {
-            moves.back().n++;
-        } else {
-            moves.push_back({ src, dst, 1 });
+        owner[dst] = owner[src];
+        owner[src] = -2;
+        if (moves != nullptr) {
+            if (!moves->empty() && moves->back().src + moves->back().n == src && moves->back().dst + moves->back().n == dst) {
+                moves->back().n++;
+            } else {
+                moves->push_back({ src, dst, 1 });
+            }
         }
         ++dst;
     }
+}
+
+uint32_t llama_kv_cache::seqs_pack_room(const std::vector<llama_seq_id> & first, llama_seq_id target) const {
+    if (!kv_window || n_stream != 1 || v_trans) {
+        return v_cells[0].size();
+    }
+    const auto & cells = v_cells[0];
+    std::vector<int32_t> owner;
+    seqs_pack_shadow(owner);
+    std::vector<llama_seq_id> others;
+    for (llama_seq_id s : first) {
+        if (s != target) {
+            others.push_back(s);
+        }
+    }
+    seqs_pack_pass(owner, others, nullptr);
+    if (target >= 0) {
+        seqs_pack_pass(owner, { target }, nullptr);
+    }
+    const uint32_t top = (uint32_t) owner.size();
+    auto is_free = [&](uint32_t j) { return j >= top || owner[j] == -2; };
+    // the target's last cell after the moves: one it owns, or a shared cell that holds it (a shared prefix)
+    int64_t last = -1;
+    if (target >= 0) {
+        for (uint32_t j = top; j-- > 0; ) {
+            if (owner[j] == target || (owner[j] == -1 && cells.seq_has(j, target))) {
+                last = j;
+                break;
+            }
+        }
+    }
+    uint32_t room = 0;
+    if (last >= 0) {
+        for (uint32_t j = (uint32_t) last + 1; j < cells.size() && is_free(j); ++j) {
+            ++room;
+        }
+        return room;
+    }
+    uint32_t run = 0;
+    for (uint32_t j = 0; j <= cells.size(); ++j) {
+        if (j < cells.size() && is_free(j)) {
+            ++run;
+            continue;
+        }
+        room = std::max(room, run);
+        run  = 0;
+    }
+    return room;
+}
+
+uint32_t llama_kv_cache::seqs_pack(const std::vector<llama_seq_id> & seqs, const std::function<void()> & sync, ggml_backend_t backend) {
+    if (!kv_window || n_stream != 1 || v_trans || seqs.empty()) {
+        return 0;
+    }
+    auto & cells = v_cells[0];
+    const uint32_t n_cells = cells.size();
+
+    using move_t = pack_move;
+    std::vector<move_t>  moves;
+    std::vector<int32_t> owner;
+    seqs_pack_shadow(owner);
+    seqs_pack_pass(owner, seqs, &moves);
     if (moves.empty()) {
         return 0;
     }
 
-    // no decode may be reading or writing the cache while its rows move. A range moves down in chunks no longer than its
-    // distance, so a chunk's source and destination never overlap; the chunks go to the backend's stream in order and the
-    // stream is synchronized once at the end (ggml_backend_tensor_copy synchronizes after each copy: 23.7k cells moved by
-    // 2,048 took 1.5 s that way, 24 ms moved in one piece)
-    sync();
+    // no decode may be reading or writing the cache while its rows move. With a backend the moves are queued on its stream
+    // without stopping it: they run after every graph already queued there and before every graph queued after, the state
+    // reads and writes synchronize the context first, and nothing on another stream touches these rows (the recurrent
+    // replay's side stream reads the recurrent rows, the draft has its own cache). Stopping the stream first cost up to ~1 s
+    // when a long prompt batch was in flight (a 58-cell pack took 896 ms). A split cache (no backend) copies synchronously
+    // after a stop. LLAMA_KV_PACK_SYNC=1 stops before and after the moves in every case
+    static const bool pack_sync = [] { const char * e = getenv("LLAMA_KV_PACK_SYNC"); return e && atoi(e) != 0; }();
+    if (backend == nullptr || pack_sync) {
+        sync();
+    }
     // with a backend, a range goes through the device scratch in two copies of up to the scratch's size, whatever its
     // distance (chunked by the distance, a 23.7k-cell move by a few cells was thousands of tiny copies: 0.5 s); without
     // one (a split cache), the chunks are no longer than the distance and each copy is synchronous
@@ -1777,7 +1835,7 @@ uint32_t llama_kv_cache::seqs_pack(const std::vector<llama_seq_id> & seqs, const
             }
         }
     }
-    if (backend != nullptr) {
+    if (backend != nullptr && pack_sync) {
         ggml_backend_synchronize(backend);
     }
     // the cell table follows, in the order of the moves (a destination is empty, or was vacated by an earlier move)

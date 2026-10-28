@@ -2365,7 +2365,10 @@ private:
                                     seqs.push_back(s.id);
                                 }
                             }
-                            n_packed = seqs.empty() ? 0 : llama_kv_pack_seqs(ctx_tgt, seqs.data(), seqs.size());
+                            // [TAG_KV_PACK] only when it lands the entry in one run (the restore places its cells wherever they fit)
+                            if (!seqs.empty() && llama_kv_pack_room(ctx_tgt, seqs.data(), seqs.size(), -1) + n_own >= n_entry) {
+                                n_packed = llama_kv_pack_seqs(ctx_tgt, seqs.data(), seqs.size());
+                            }
                         }
                         LOG_WRN("[scheduler] cache_restore_room: t_us=%" PRId64 " slot=%d entry=%zu tokens, free=%u + own %zu, cleared=%zu, packed=%u: %s\n",
                                 ggml_time_us(), ret->id, n_entry, n_free, n_own, n_cleared, n_packed, restore ? "restore" : "no room, skipped");
@@ -6107,9 +6110,17 @@ private:
                                 }
                             }
                             const int64_t  t0    = ggml_time_us();
-                            uint32_t       moved = seqs.empty() ? 0 : llama_kv_pack_seqs(ctx_tgt, seqs.data(), seqs.size());
                             const llama_seq_id own = slot.id;
-                            moved += llama_kv_pack_seqs(ctx_tgt, &own, 1);
+                            // [TAG_KV_PACK] only a pack that gives the room: a 49k-token prompt beside generating slots packed
+                            // before each of its 2k chunks, moved 58-661 cells, kept ~6k of room and paid up to ~1 s each time
+                            std::vector<llama_seq_id> all = seqs;
+                            all.push_back(own);
+                            const uint32_t room_after = llama_kv_pack_room(ctx_tgt, all.data(), all.size(), own);
+                            uint32_t       moved      = 0;
+                            if ((uint64_t) n_add <= room_after) {
+                                moved  = seqs.empty() ? 0 : llama_kv_pack_seqs(ctx_tgt, seqs.data(), seqs.size());
+                                moved += llama_kv_pack_seqs(ctx_tgt, &own, 1);
+                            }
                             seqs.push_back(own);
                             if (moved > 0) {
                                 room = llama_kv_room(ctx_tgt, slot.id);

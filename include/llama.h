@@ -847,6 +847,10 @@ extern "C" {
     // [TAG_KV_PACK] move the given sequences' cells down over the free cells below them so the free space is one run (the idle
     // slots' conversations and the prompt's own, before one of them would be cleared); returns the cells moved
     LLAMA_API uint32_t llama_kv_pack_seqs(struct llama_context * ctx, const llama_seq_id * seqs, size_t n);
+    // [TAG_KV_PACK] the room `target` would have after packing seqs (target excluded) and then target on top, without
+    // moving anything (the free cells after its last cell, or the largest free run when it has none; target < 0: the
+    // largest free run after packing seqs)
+    LLAMA_API uint32_t llama_kv_pack_room(struct llama_context * ctx, const llama_seq_id * seqs, size_t n, llama_seq_id target);
 
     // Copy all tokens that belong to the specified sequence to another sequence
     // p0 < 0 : [0,  p1]

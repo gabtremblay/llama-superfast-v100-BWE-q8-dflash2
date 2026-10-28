@@ -280,6 +280,7 @@ public:
     uint32_t kv_n_free() const;                   // [TAG_KV_ADMIT]
     bool     kv_compact_seq(llama_seq_id seq_id, uint32_t n_next); // [TAG_KV_COMPACT] for the whole rest of a prompt
     uint32_t kv_pack_seqs(const llama_seq_id * seqs, size_t n); // [TAG_KV_PACK]
+    uint32_t kv_pack_room(const llama_seq_id * seqs, size_t n, llama_seq_id target) const; // [TAG_KV_PACK]
     void     kv_place_hint(llama_seq_id seq_id, uint32_t n_tokens); // [TAG_KV_PLACE_LOW]
     uint32_t graph_max_nodes(uint32_t n_tokens) const;
 

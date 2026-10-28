@@ -194,6 +194,17 @@ public:
     // the device scratch the pack moves a range through (allocated on first use from the cache's buffer type, 64 MiB)
     ggml_backend_buffer_ptr pack_scratch;
 
+    // [TAG_KV_PACK] the room `target` would have after seqs_pack(first) and then seqs_pack({target}) (the server's two steps;
+    // the free cells after its last cell, or the largest free run when it has none), without moving anything; the cache
+    // size when the window placement is off
+    uint32_t seqs_pack_room(const std::vector<llama_seq_id> & first, llama_seq_id target) const;
+
+    // the shadow of the cell table the pack plans over (-2 empty, -1 shared by several sequences, else the cell's sequence),
+    // and one pass over it: the cells of the movable sequences go down to the lowest free cell below them, in order
+    struct pack_move { uint32_t src, dst, n; };
+    void seqs_pack_shadow(std::vector<int32_t> & owner) const;
+    static void seqs_pack_pass(std::vector<int32_t> & owner, const std::vector<llama_seq_id> & movable, std::vector<pack_move> * moves);
+
     // the start of the free run for need cells: the lowest run of need + margin cells, else the largest of at least need; -1 when none
     int64_t free_run_for(const llama_kv_cells & cells, uint32_t need) const;
     std::vector<uint32_t> place_hint; // [TAG_KV_PLACE_LOW] per sequence
