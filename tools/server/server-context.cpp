@@ -4927,9 +4927,14 @@ private:
 
     // the slot's task can be a job: a completion, no embeddings, no LoRA, no parent or child
     bool tu_eligible(const server_slot & slot) const {
-        // [TAG_TU_MTMD] a prompt with media (an image's embeddings go in as a chunk of their own) is read in the batch
+        // [TAG_TU_MTMD] a prompt with media is read as jobs too: its text goes into the jobs like any prompt's, and each image
+        // chunk is decoded on its own when the fill reaches it, before the text after it (as in the batch), with no job of
+        // the slot active. Kept out of the jobs, such a prompt was read only in the batch, which takes no prompt while another
+        // prompt's job lives: it waited for that job, then held the other slots for each of its 2k chunks (a 56k-token
+        // prompt with images at ~400 tok/s beside three generating slots). LLAMA_TU_MEDIA_JOBS=0: media prompts in the batch
+        static const bool media_jobs = [] { const char * e = getenv("LLAMA_TU_MEDIA_JOBS"); return e ? atoi(e) != 0 : true; }();
         return slot.task && slot.task->type == SERVER_TASK_TYPE_COMPLETION && !slot.need_embd() && slot.lora.empty() &&
-            !slot.task->is_parent() && !slot.task->is_child() && !slot.task->tokens.has_media();
+            !slot.task->is_parent() && !slot.task->is_child() && (media_jobs || !slot.task->tokens.has_media());
     }
 
     // prompt tokens the reader has left to read: not yet filled, plus the job's not yet completed. A
