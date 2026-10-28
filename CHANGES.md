@@ -284,6 +284,11 @@ and 2.9 GB of swap before the guard dropped two entries). A returning conversati
 checkpoint; an older checkpoint only shortens the re-read of a history edited in the middle, which with the trim is
 read from the start up to the edit (the same answer, read again: ~1 s per 900 tokens alone, 1.3-3 s under load).
 
+Measured on a 65,536-token pool (`ckpttrim.sh`): a 38,359-token conversation with its follow-ups, saved when another
+prompt took its slot and restored on its return, is a 2,602 MiB entry with every checkpoint and 1,844 MiB with the
+newest two; the save takes 853 / 758 ms, the restore 528 / 498 ms, and both give back 38,308 tokens and the same 48
+greedy tokens as before the save.
+
 ## 15. Rollback by replay: one state a slot instead of a snapshot a token
 
 A verify step runs the draft's 8 tokens through the recurrent layers at once, and the rollback to the accepted count
@@ -352,3 +357,43 @@ no cell, the batch was halved down to 2 rows, and the speculative batch bookkeep
 admission check crashed the server on its first refusal (the two-user scheduler read the refused slot's task after
 its release); `tu_remaining()` now returns 0 for a slot without a task and the refusal clears the round's reader pick.
 
+## 18. Four agents at once: packs that pay, the joint step's empty tiles, image prompts as jobs
+
+Commits `0dd2de6`, `bc26d4f`, `21c9092`, `fef620a` (and `89c8385`, the cache entries' checkpoints, in section 16).
+
+Production logs under four agents showed three costs beside the reads themselves: a 49k-token prompt beside
+generating slots packed the pool before each of its 2k chunks (58-661 cells moved, ~6k cells of room kept, up to ~1 s
+each), a prompt holding an image held the other slots for each of its chunks, and the joint verify step of four slots
+cost 1.6-2.4x a single slot's.
+
+- **A pack only when it gives the room.** A dry run of the server's two steps (the idle conversations, then the
+  requester on top) over a shadow of the cell table gives the room the requester would have, counting the compact that
+  follows when the room after its cells is still short (`llama_kv_pack_room`); the pack runs only if that holds the
+  request. Before a restore, it runs only when it lands the entry in one run. The first build of the check counted only
+  the room after the requester's cells: a 3.8k-cell conversation under an idle one it could not pass had none, though
+  20k cells were free on top, and two idle 18k-token conversations were cleared instead (the pack probe caught it).
+- **Pack copies without stopping the GPU.** With a device backend the moves are queued on its stream: they run after
+  every graph already queued there and before every graph queued after, the state reads and writes synchronize the
+  context first, and nothing on another stream touches these rows. The stall was the pack waiting for the queued prompt
+  batch, not the copy. `LLAMA_KV_PACK_SYNC=1` stops before and after the moves as before; a split cache stays synchronous.
+- **The verify kernel skips the tiles no row can see.** A step over several sequences attends over the span of all
+  their cells, each row only to its own sequence's, so most 64-key tiles are -inf for a whole 8-row block. A pre-pass
+  lists the tiles any row of the block sees (`tiles_used`, one block per 8-row half and stream) and the streaming kernel
+  walks that list. It helps one slot too: in a shared pool its span crosses the other conversations' cells.
+  `LLAMA_FATTN_VERIFY_STREAM_SKIP=0` walks the whole span. `test-backend-ops` has the verify calls with the mask of a
+  joint batch of up to four sequences (shared prefix, owned blocks across tile edges, a hole, causal batch rows).
+- **Image prompts as scheduler jobs.** A prompt holding media was kept out of the two-user scheduler, so it waited for
+  the running job, then held the other slots for each of its chunks. Its text now goes into jobs like any prompt's;
+  each image chunk is decoded on its own when the fill reaches it. `LLAMA_TU_MEDIA_JOBS=0` keeps media prompts in the batch.
+
+Measured on the dev build (one V100, 200 W):
+
+| Case | Before (switch off) | After |
+|---|---|---|
+| Four ~30k-token conversations generating 1,200 tokens together (`joint4.sh`) | 83.8 ms a step, 132 tok/s in all | 76.6 ms a step, 151 tok/s in all |
+| One of them generating alone, the other three idle in the pool | 53.6 ms a step, 62.7 tok/s | 48.0 ms a step, 70.1 tok/s |
+| A conversation grows 16k past an idle one (`kvpack.sh`, 65,536-token pool) | 23,739 cells packed in 24.4 ms (stopping the GPU) | 23,739 cells in 13.8 ms; the same greedy answers from moved cells |
+| Three slots stream while a fourth reads an image and a 20k-token log (`media_probe.py`, vision launcher) | the image prompt in 39.1 s; the others stall up to 3.7 s, 295 tokens streamed during the read | the image prompt in 56.8 s; the others stall at most 1.1 s, 3,422 tokens streamed during the read; the same answer |
+
+The image prompt takes longer as a job for the reason a text prompt does: the generating slots keep their rounds while
+it is read.

@@ -46,7 +46,8 @@ Against upstream at `403f06f`, one line each. The design, the measurements and t
 
 - **The two-user scheduler with DFlash2 on a unified cache**: a side prompt is read beside the generating slot from the moment it arrives, and the generating slot gets more rounds per group as the read deepens. ([§8](CHANGES.md#8-the-two-user-scheduler-with-dflash2-on-a-unified-cache))
 - **A full pool fails fast and keeps what it holds**: a prompt that cannot fit is refused at once, a request never pushes out a big conversation while a slot is empty, and a returning conversation gets room before its restore. ([§17](CHANGES.md#17-a-full-pool-the-slot-kept-the-prompt-that-cannot-fit-refused-room-made-for-a-restore))
-- **Vision with the scheduler on**: a loaded projector no longer turns the scheduler off; only a prompt holding media pauses the other slots. ([Vision](#vision))
+- **Four agents' rounds kept short**: the joint verify step skips the KV tiles none of its rows can see (9% off a four-slot step, 10% off one slot's in a shared pool), the pool packs only when that gives the room and without stopping the GPU, and a cached conversation keeps its newest two checkpoints (29% smaller). ([§18](CHANGES.md#18-four-agents-at-once-packs-that-pay-the-joint-steps-empty-tiles-image-prompts-as-jobs), [§16](CHANGES.md#16-the-prompt-cache-gives-back-the-conversations-that-left-the-slots))
+- **Vision with the scheduler on**: a loaded projector no longer turns the scheduler off, and a prompt holding an image is read as a job like any other, so the other slots keep streaming. ([Vision](#vision), [§18](CHANGES.md#18-four-agents-at-once-packs-that-pay-the-joint-steps-empty-tiles-image-prompts-as-jobs))
 - **Two or more cards by code reading**: every addition adapted to upstream's tensor-parallel path, untested here. ([below](#two-or-four-cards-tensor-parallel-untested))
 
 **Build**
@@ -119,6 +120,23 @@ against 0.425 in this run), the verify step is the same. What the cache costs is
 its slot, ~0.64 s for 47k tokens: the bench sees it as prefill 2–3% slower from 12k tokens up, since each of its
 prompts displaces the previous one, and as four first tokens near 1 s. What it gives, a returning conversation back in
 under a second instead of a re-read of minutes, never shows here: the bench's conversations do not return.
+
+[Section 18](CHANGES.md#18-four-agents-at-once-packs-that-pay-the-joint-steps-empty-tiles-image-prompts-as-jobs)'s
+build (rsQ) against the one before it (rsP), back to back the same way, both with the Run line:
+
+| BetterBench, temperature 1.0 | rsP | rsQ, section 18 |
+|---|---|---|
+| Time to first token, single stream (p50) | 192 ms | 191 ms |
+| Single-stream decode, median of 160 runs | 112.8 tok/s | 108.7 tok/s |
+| Verify step, server side: one stream / requests in flight | 41.8 / 55.7 ms | 41.8 / 54.8 ms |
+| Cold prefill, 12k / 24k / 47k-token prompts | 933 / 892 / 815 tok/s | 938 / 894 / 816 tok/s |
+| Aggregate decode, 1 / 2 / 4 requests in flight | 90 / 108 / 153 tok/s | 91 / 114 / 151 tok/s |
+| Peak VRAM / lowest host memory available | 32,094 MiB / 4.2 GB | 32,296 MiB / 4.6 GB |
+
+The same again within the bench's noise: the decode median follows the draft's acceptance (0.429 against 0.416), the
+verify step is the same, and neither run had an error. The bench's conversations are short beside the pool, so the
+step's tile skip (9-10% at ~30k tokens a conversation), the packs and the image jobs do not show in it; section 18's
+probes measure them.
 
 ## Build
 
@@ -282,13 +300,16 @@ What was measured, on the build before the replay (four slots, the shared snapsh
   85–108 tok/s with the draft (a red square, a blue circle and a white band in a test image are all named).
 - Text requests are unchanged: four in flight 130–134 tok/s combined, 47k-token prompts at 843 tok/s. The two-user
   scheduler stays on with a projector loaded (`TAG_TU_MTMD`): a text prompt is read as a job beside the other slots'
-  decodes as before, and only a prompt that holds media is read in the batch, so a decoding slot pauses for the ~6 s a
-  large image takes. Without that change the scheduler went off as soon as `--mmproj` was given, and four text
+  decodes as before. Without that change the scheduler went off as soon as `--mmproj` was given, and four text
   requests in flight fell to 71 tok/s combined.
+- Since [section 18](CHANGES.md#18-four-agents-at-once-packs-that-pay-the-joint-steps-empty-tiles-image-prompts-as-jobs) a
+  prompt holding an image is read as jobs too, each image decoded on its own when the read reaches it: with three slots
+  streaming, an image plus a 20k-token log took 56.8 s instead of 39.1 s, and the streaming slots paused at most 1.1 s
+  instead of 3.7 s, streaming 3,422 tokens during the read instead of 295 (`LLAMA_TU_MEDIA_JOBS=0`: the old way).
 - With a projector loaded, llama.cpp's prompt cache reuse and context shift are off for every slot (upstream's rule), and
   so is the fork's tail-snapshot checkpoint for prompts that hold media.
 - Not measured since: the replay freed 1.0 GB of the card, so a pool larger than 196,608 may fit with the projector,
-  and the host prompt cache in the line above has not run with images.
+  and the host prompt cache in the line above has run with images only in production use, not under a probe.
 
 ## Known limits
 
