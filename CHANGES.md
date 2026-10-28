@@ -397,3 +397,39 @@ Measured on the dev build (one V100, 200 W):
 
 The image prompt takes longer as a job for the reason a text prompt does: the generating slots keep their rounds while
 it is read.
+
+## 19. Row moves in one launch, and a long idle conversation cleared once it is cached
+
+Commits `31dc568`, `21e36c7`.
+
+Production under four agents, 28 minutes with the pool near full (four conversations of 47-82k tokens): 15 packs that held
+every slot 6.7 s in all, the worst 1.53 s, and one of 4,316 cells 503 ms; a compaction 1.0 s; and a main thread's new
+18,478-token prompt refused (8,532 cells free) beside an idle 121k-token conversation and an idle 36k one.
+
+- **The moves in one launch.** Four slots generating at once interleave their conversations' cells in short runs; a pack
+  of them was thousands of runs, two copies a run through the scratch for each layer's K and V, and the time went to
+  issuing them (58,379 cells in long runs took 33 ms). `ggml_backend_cuda_kv_move_rows` walks the moves in order in one
+  launch over every K and V tensor: block (t, c) takes tensor t's columns [c0, c1) of each row (a byte only moves to the
+  same column of another row), reads each chunk into registers, syncs, then writes, so a move overlapping its source from
+  below, and a later move over rows an earlier one vacated, stay exact. A compaction's destination is a free run, so it
+  takes the kernel too and no longer stops the GPU. Moves the kernel does not take (out of range, overlapping from above,
+  destinations out of order, reading rows an earlier move wrote) and a split cache copy run by run, where a run that does
+  not overlap its destination now takes one copy instead of two. `LLAMA_KV_MOVE_KERNEL=0` copies run by run;
+  `LLAMA_KV_MOVE_VERIFY=1` checks the first and the last tensor's moved rows against their sources, byte for byte (it
+  stops the stream: for tests). The pack and the compaction log their run count.
+- **A longer idle conversation cleared once the prompt cache holds it.** Only idle conversations shorter than the request
+  were cleared, a rule from before the host prompt cache, when clearing a long one meant re-reading it for minutes; now
+  one comes back in about a second. When the shorter ones are not enough, the longer ones are cleared too, the least
+  recently used first, but only those the cache took; without a cache, or when the save fails, a longer one stays and the
+  request is refused as before. The clearing also runs while the admission check would refuse, not only while the slot
+  lacks room.
+- A save's timing (allocation, state, checkpoints) is one log line (`prompt saved:`), for the save that still holds every
+  slot.
+
+Measured on the dev build (65,536-token pool):
+
+| Case | Result |
+|---|---|
+| A fragmented pack (`kvfrag_eq.py`, three conversations generating together) | 357 runs, 35,597 cells in 16 ms, queued in 0.06 ms; every moved conversation's 48 greedy tokens identical to a fresh read |
+| `LLAMA_KV_MOVE_VERIFY=1` on every pack and compaction of the probes | identical, byte for byte |
+| Three idle conversations of 20k, 19k and 18k tokens, a new 15k one (`kvadmit2_probe.py`, cache 15 GiB) | the new one admitted, the 20k one saved and cleared, and back from the cache when it returns (20,015 tokens cached, 63 read, 1.6 s) |

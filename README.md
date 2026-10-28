@@ -33,7 +33,7 @@ Against upstream at `403f06f`, one line each. The design, the measurements and t
 - **Rollback by replay on its own stream**: one kept recurrent state a slot, the draft's accepted tokens replayed under the draft. ([§15](CHANGES.md#15-rollback-by-replay-one-state-a-slot-instead-of-a-snapshot-a-token))
 - **A capped CUDA graph cache**: 48 graphs for 120 s instead of 512 for 600 s, ~1.2 GB of VRAM that only grew under real traffic. ([§5](CHANGES.md#5-a-smaller-cuda-graph-cache))
 - **A conversation's cells stay one run of the pool**: placement right after its last cell or in the lowest free run, a boxed-in prefix moved before its ubatch, new conversations low in the pool. ([§6](CHANGES.md#6-cell-placement-in-a-unified-cache), [§11](CHANGES.md#11-compaction-of-a-boxed-in-prefix), [§14](CHANGES.md#14-a-prompts-cells-stay-one-run-low-in-the-pool))
-- **Nothing is cleared for a fragmented pool**: the idle conversations pack down (23.7k cells in 14 ms, without stopping the GPU) before one is ever cleared for a prompt, and a conversation that is cleared comes back from host RAM in under a second instead of a re-read of minutes, while the cache keeps 4 GiB of the host's memory free. ([§14](CHANGES.md#14-a-prompts-cells-stay-one-run-low-in-the-pool), [§16](CHANGES.md#16-the-prompt-cache-gives-back-the-conversations-that-left-the-slots), [§18](CHANGES.md#18-four-agents-at-once-packs-that-pay-the-joint-steps-empty-tiles-image-prompts-as-jobs))
+- **Nothing is cleared for a fragmented pool**: the idle conversations pack down (23.7k cells in 14 ms, without stopping the GPU; a fragmented pack of 357 runs in 16 ms, in one launch) before one is ever cleared for a prompt, and a conversation that is cleared comes back from host RAM in under a second instead of a re-read of minutes, while the cache keeps 4 GiB of the host's memory free. ([§14](CHANGES.md#14-a-prompts-cells-stay-one-run-low-in-the-pool), [§16](CHANGES.md#16-the-prompt-cache-gives-back-the-conversations-that-left-the-slots), [§18](CHANGES.md#18-four-agents-at-once-packs-that-pay-the-joint-steps-empty-tiles-image-prompts-as-jobs), [§19](CHANGES.md#19-row-moves-in-one-launch-and-a-long-idle-conversation-cleared-once-it-is-cached))
 
 **Speed**
 
@@ -277,7 +277,9 @@ LLAMA_DFLASH2_HEAD_FILE=models/mtp-Qwen3.8-27B-Q4_0.gguf LLAMA_SPEC_DRAFT_VOCAB_
 - The cache's save copies a conversation that leaves its slot while every slot waits, ~0.64 s for 47k tokens.
 - A prompt that cannot fit the pool beside the other conversations is refused at once with the context-size error
   ([§17](CHANGES.md#17-a-full-pool-the-slot-kept-the-prompt-that-cannot-fit-refused-room-made-for-a-restore)):
-  the client has to compact it or wait. Each agent's conversation counts against the one pool, so a client that
+  the client has to compact it or wait. Idle conversations are cleared for it first, a longer one only once the prompt
+  cache holds it ([§19](CHANGES.md#19-row-moves-in-one-launch-and-a-long-idle-conversation-cleared-once-it-is-cached)),
+  so it is refused when the generating conversations hold the pool. Each agent's conversation counts against the one pool, so a client that
   lets every conversation grow toward 262,144 tokens (opencode's `limit.context`) runs into it with several agents.
 - Two or more cards (`--split-mode tensor`) are supported by code reading only (the section after `## Run`): nothing
   here has run on more than one card.
