@@ -1817,6 +1817,23 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
         }
     }
 
+    // [TAG_CACHE_RECYCLE_FIT] a recycled buffer is kept only when it holds the new state without growing and without much
+    // slack. One too small would reallocate on resize and copy its old bytes, the old and the new buffer both resident: a
+    // 229k-token conversation's 7.5 GB entry recycled for its 7.9 GB successor took the host past its memory and swap, and
+    // the server was OOM-killed. One far too large keeps resident memory the cache's size does not count. Either is freed
+    // here, before the host-memory check reads MemAvailable
+    {
+        const auto fits = [](const server_state_bytes & b, size_t n) {
+            return b.capacity() >= n && b.capacity() - n <= std::max<size_t>(n/8, (size_t) 64 << 20);
+        };
+        if (!fits(state_data_tgt, state_size_tgt)) {
+            server_state_bytes().swap(state_data_tgt);
+        }
+        if (!fits(state_data_dft, state_size_dft)) {
+            server_state_bytes().swap(state_data_dft);
+        }
+    }
+
     // [TAG_CACHE_HOSTMEM] the host must keep LLAMA_CACHE_RESERVE_MIB (default 4096) available after the new entry: the
     // cache's size counts its state vectors and checkpoints, not the checkpoint blocks its entries take from the pinned
     // reserve (the slots' next checkpoints then take fresh anonymous memory) nor the recycle pool, and with --cache-ram

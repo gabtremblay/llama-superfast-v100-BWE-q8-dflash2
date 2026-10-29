@@ -471,3 +471,17 @@ Measured on the dev build (65,536-token pool, cache 15 GiB):
 
 Every background save of the probes was identical, target and draft, to a synchronous save of the same cells, and the
 cleared conversation came back from the cache when it returned.
+
+## 21. A recycled cache buffer that would grow is freed first
+
+The cache reuses the state buffers of the entries it drops to make room. When the new conversation's state was larger
+than the recycled buffer's capacity, the resize reallocated it and copied its old bytes, so the old and the new buffer
+were both resident. In production, a 229k-token conversation's 7.9 GB save recycled the 7.5 GB buffer of the entry it
+replaced; with the 15 GiB cache and the pinned checkpoint reserve, the host ran out of memory and swap, and the kernel
+killed the server. The host-memory check (`LLAMA_CACHE_RESERVE_MIB`) had counted the recycled buffer as room, which it
+was not while both copies lived.
+
+A recycled buffer is now kept only when it holds the new state without growing and with at most an eighth (or 64 MiB)
+of slack; otherwise it is freed before the host-memory check reads `MemAvailable`, and the new buffer is allocated
+fresh (not zeroed: the background save's worker takes its page faults). The slack bound also stops a large buffer
+reused for a small entry from keeping memory the cache's size does not count.
