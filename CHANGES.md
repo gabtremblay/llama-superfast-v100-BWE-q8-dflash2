@@ -485,3 +485,32 @@ A recycled buffer is now kept only when it holds the new state without growing a
 of slack; otherwise it is freed before the host-memory check reads `MemAvailable`, and the new buffer is allocated
 fresh (not zeroed: the background save's worker takes its page faults). The slack bound also stops a large buffer
 reused for a small entry from keeping memory the cache's size does not count.
+
+## 22. An outside review's four findings: the save's recurrent rows, short appends' scratch, the restore, the limit
+
+An outside review of 59a46eb found four problems; each held up in the code and is fixed here.
+
+- **A background save could read another conversation's recurrent rows** (`TAG_CACHE_BG_RS`). The save records the
+  rows' addresses and the worker copies them later, attention cache first. Meanwhile the slot is held, but other
+  sequences' batches move recurrent rows: `find_slot` gathers a batch's sequences into consecutive cells (swapping the
+  cells between them) and a prompt job takes the top cell. A saved row could be rewritten before the worker read it,
+  and the restored conversation would carry another's state, silently. Now a rollback still to replay for the sequence
+  replays before the save records anything; the worker copies the recurrent rows first, ahead of any job's rest (the
+  rest goes in 256 MiB slices, so another save's rows never wait behind a whole conversation); and the saving sequence is
+  pinned: a gather, or a row copy, that would rewrite its row first waits for those rows (logged as `a recurrent row
+  move waited`). Twenty-two background saves under `LLAMA_CACHE_BG_VERIFY=1`, two slots generating beside them, were
+  identical to synchronous saves; the probes did not produce a row move during a save, so the wait itself is checked by
+  the code, not by a run.
+- **A short append at depth took up to 640 MiB of scratch** (`TAG_GQA6_KV_BUDGET`). The 6-head route sized its key
+  blocks from the 128 MiB score budget alone, and a 17-token call's block reached 131,072 keys: 512 MiB of F16 keys
+  and values beside the scores, on a card with ~0.6 GB to spare (the pool keeps its high-water mark). The F16 K/V now
+  stay within 64 MiB too. Peak memory of the perf run 2,464 -> 2,014 MiB; 128 tokens and up unchanged (within 1%), 17
+  and 32 tokens 4-7% slower (+0.6 ms a layer at 168k keys). 78 Q8_0 attention cases, two new ones over 40,960 keys, pass.
+- **Making room could drop the conversation about to be restored** (`TAG_CACHE_RESTORE_PIN`). The slot's outgoing
+  conversation was saved, and idle ones cleared, before the restore candidate was chosen, and the cache drops its
+  oldest entries for room. The candidate is now pinned before those saves and unpinned after the restore; a save that
+  then has no room is skipped. One slot, a cache holding one conversation, A then B then A: A was re-read in 21.8 s
+  before, restored in 0.8 s now.
+- **The cache limit did not hold while the remaining entries were being written** (`TAG_CACHE_LIMIT_HOLD`). With no
+  idle entry left to drop, the new entry went in over the limit; it is now skipped. The host-memory check also takes
+  the entries still being written off `MemAvailable` (their pages are not resident yet).

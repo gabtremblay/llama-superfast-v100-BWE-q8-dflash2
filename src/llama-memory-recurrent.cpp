@@ -91,6 +91,7 @@ llama_memory_recurrent::llama_memory_recurrent(
     rs_depth.assign(n_seq_max, 0);
     rs_snapbase.assign(n_seq_max, 0);
     rs_lock.assign(n_seq_max, 0);
+    rs_bg_pin.assign(n_seq_max, 0);
 
     // [TAG_RS_REPLAY]
     {
@@ -616,10 +617,25 @@ uint32_t llama_memory_recurrent::rs_row(uint32_t idx, llama_seq_id seq, uint32_t
 // a rollback snapshot still to be read (rs_idx) is applied now: it goes to the live row, which the next decode then reads as
 // s_copy would have read the snapshot (the caller synchronized the device), so the sequence's run is free to move
 // [TAG_RS_JOB_TOP] rows row_src -> row_dst of every layer's state tensors, with the backend copy (the caller synchronized the device)
+// [TAG_CACHE_BG_RS]
+void llama_memory_recurrent::rs_bg_guard(int32_t c0, int32_t c1) {
+    if (!rs_bg_sync_fn) {
+        return;
+    }
+    for (size_t s = 0; s < rs_bg_pin.size() && s < size; ++s) {
+        const int32_t c = cells[s].tail;
+        if (rs_bg_pin[s] && c >= c0 && c < c1) {
+            rs_bg_sync_fn();
+            return;
+        }
+    }
+}
+
 bool llama_memory_recurrent::rs_copy_rows(uint32_t row_src, uint32_t row_dst) {
     if (row_src == row_dst) {
         return true;
     }
+    rs_bg_guard((int32_t) row_dst, (int32_t) row_dst + 1); // [TAG_CACHE_BG_RS]
     if (rs_side_sync_fn) {
         rs_side_sync_fn(); // [TAG_RS_REPLAY_SIDE]
     }
@@ -1092,6 +1108,9 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
         if (min > seq_meta.tail) { min = seq_meta.tail; }
         if (max < seq_meta.tail) { max = seq_meta.tail; }
     }
+
+    // [TAG_CACHE_BG_RS] the cells the batch's sequences gather into: a saving sequence's cell among them would be swapped
+    rs_bg_guard(min, min + (int32_t) n_seqs);
 
     // gather and re-order
     for (uint32_t s = 0; s < n_seqs; ++s) {

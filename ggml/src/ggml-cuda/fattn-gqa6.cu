@@ -790,10 +790,19 @@ bool ggml_cuda_fattn_gqa6_applies(const ggml_tensor* dst) {
 }
 
 // Nb for a chunk of rows_pad packed rows: the largest multiple of 256 keeping the scores (heads x rows_pad x Nb x 2 bytes)
-// within 128 MiB, at least 256 (and no more keys than the call has)
-static int gqa6_block_n(const int n_heads, const int rows_pad, const int n_kv) {
+// within 128 MiB, at least 256 (and no more keys than the call has).
+// [TAG_GQA6_KV_BUDGET] on a Q8_0 cache the block's keys and values widened to F16 (2 x heads x Nb x 256 x 2 bytes) stay
+// within 64 MiB too: with the scores alone setting Nb, a short call took a block as wide as its few rows allowed (17
+// tokens, 128 packed rows: 131,072 keys, 512 MiB of F16 K/V beside 128 MiB of scores) on a card with ~0.6 GB to spare,
+// and the pool keeps its high-water mark. A 1,024-token chunk (2,560 keys, 10 MiB) is unchanged
+static int gqa6_block_n(const int n_heads, const int rows_pad, const int n_kv, const bool kv_q8) {
   const size_t score_budget = size_t(128) << 20;
-  int block_n = int(std::min<size_t>(score_budget / (size_t(n_heads) * rows_pad * sizeof(half)), size_t(INT32_MAX / 2)));
+  const size_t kv16_budget  = size_t(64) << 20;
+  size_t keys = score_budget / (size_t(n_heads) * rows_pad * sizeof(half));
+  if (kv_q8) {
+    keys = std::min(keys, kv16_budget / (2 * size_t(n_heads) * kHeadDim * sizeof(half)));
+  }
+  int block_n = int(std::min<size_t>(keys, size_t(INT32_MAX / 2)));
   block_n = std::max(block_n / kTileKeys * kTileKeys, kTileKeys);
   return std::min(block_n, n_kv);
 }
@@ -819,6 +828,8 @@ void ggml_cuda_flash_attn_ext_gqa6(ggml_backend_cuda_context& ctx, ggml_tensor* 
   static const int row_chunk = gqa6_env("LLAMA_FA_GQA6_ROW_CHUNK", GQA6_ROW_CHUNK);
   const int chunk_tokens = row_chunk > 0 ? std::min(row_chunk, n_tokens) : n_tokens;
 
+  const bool kv_q8 = K->type == GGML_TYPE_Q8_0;
+
   // the workspace, allocated once for the largest chunk's needs (the full chunk and the last, shorter one) and reused
   size_t q16_size = 0;
   size_t scores_size = 0;
@@ -829,7 +840,7 @@ void ggml_cuda_flash_attn_ext_gqa6(ggml_backend_cuda_context& ctx, ggml_tensor* 
       continue;
     }
     const int rows_pad = GGML_PAD(t * kQPerKV, TBShape::kM);
-    const int block_n = gqa6_block_n(n_heads, rows_pad, n_kv);
+    const int block_n = gqa6_block_n(n_heads, rows_pad, n_kv, kv_q8);
     q16_size = std::max(q16_size, size_t(n_heads) * rows_pad * kHeadDim);
     scores_size = std::max(scores_size, size_t(n_heads) * rows_pad * block_n);
     stats_size = std::max(stats_size, 3 * size_t(n_heads) * (block_n / kTileKeys) * rows_pad + 4 * size_t(n_heads) * rows_pad);
@@ -841,8 +852,7 @@ void ggml_cuda_flash_attn_ext_gqa6(ggml_backend_cuda_context& ctx, ggml_tensor* 
   ggml_cuda_pool_alloc<float> out(pool, kSplitK * q16_size);
 
   // a Q8_0 cache: one key block of K and of V widened to F16 as [head][key][256] (ld 256, head stride width*256), rewritten
-  // per block. At most heads x Nb x 256 halves each (4 KV heads, 10,752 keys: 21 MiB), instead of the whole cache
-  const bool kv_q8 = K->type == GGML_TYPE_Q8_0;
+  // per block. At most heads x Nb x 256 halves each, 32 MiB (TAG_GQA6_KV_BUDGET), instead of the whole cache
   ggml_cuda_pool_alloc<half> k16(pool);
   ggml_cuda_pool_alloc<half> v16(pool);
   if (kv_q8) {
@@ -867,7 +877,7 @@ void ggml_cuda_flash_attn_ext_gqa6(ggml_backend_cuda_context& ctx, ggml_tensor* 
   for (int t0 = 0; t0 < n_tokens; t0 += chunk_tokens) {
     const int rows = std::min(chunk_tokens, n_tokens - t0) * kQPerKV;
     const int rows_pad = GGML_PAD(rows, TBShape::kM);
-    const int block_n = gqa6_block_n(n_heads, rows_pad, n_kv);
+    const int block_n = gqa6_block_n(n_heads, rows_pad, n_kv, kv_q8);
     const int max_tiles = block_n / kTileKeys;
 
     const int64_t stats_head_stride = int64_t(max_tiles) * rows_pad;

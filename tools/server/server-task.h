@@ -641,6 +641,9 @@ struct server_prompt_cache_state {
 
     // [TAG_CACHE_BG_SAVE] its state is still being copied in (server_slot::prompt_save_bg): not loaded, dropped or reused
     bool busy = false;
+    // [TAG_CACHE_RESTORE_PIN] the entry a launching task is about to restore: the saves that make room for it (the slot's
+    // outgoing conversation, the idle ones cleared for the pool) do not drop it
+    bool pinned = false;
 
     size_t size() const {
         size_t res = data.size();
@@ -689,7 +692,11 @@ struct server_prompt_cache {
     // [TAG_CACHE_ROOM] the tokens of the entry load() would restore for tokens_new into a slot holding prompt (0: none)
     size_t restore_n_tokens(const server_prompt & prompt, const server_tokens & tokens_new) const;
 
-    // [TAG_CACHE_BG_SAVE] the oldest entry not being written (states.end() when there is none)
+    // [TAG_CACHE_RESTORE_PIN] pins the entry load() would restore (see restore_n_tokens); unpin_all releases every pin
+    void pin_restore(const server_prompt & prompt, const server_tokens & tokens_new);
+    void unpin_all();
+
+    // [TAG_CACHE_BG_SAVE] the oldest entry not being written nor pinned (states.end() when there is none)
     std::list<server_prompt_cache_state>::iterator oldest_idle();
 };
 

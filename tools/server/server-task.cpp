@@ -1784,7 +1784,7 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
     for (auto it = states.begin(); it != states.end();) {
         const int len = it->prompt.tokens.get_common_prefix(prompt.tokens);
 
-        if (len == (int) it->prompt.tokens.size() && !it->busy) {
+        if (len == (int) it->prompt.tokens.size() && !it->busy && !it->pinned) {
             SRV_TRC(" - removing obsolete cached prompt with length %d\n", len);
 
             it = states.erase(it);
@@ -1814,6 +1814,13 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
                 state_data_dft = std::move(old.drft);
             }
             states.erase(it);
+        }
+        // [TAG_CACHE_LIMIT_HOLD] the entries left are being written or about to be restored: the limit still holds, the
+        // save is skipped (it used to go in over the limit)
+        if (size() + state_size_new > limit_size) {
+            SRV_WRN(" - prompt cache: %.0f MiB held by entries being written or restored, the entry needs %.0f MiB under the %.0f MiB limit: not saved\n",
+                    size() / 1048576.0, state_size_new / 1048576.0, limit_size / 1048576.0);
+            return nullptr;
         }
     }
 
@@ -1845,7 +1852,26 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
             return (size_t) (e ? std::max(0, atoi(e)) : 4096) << 20;
         }();
         const size_t need  = state_size_new + reserve;
-        size_t       avail = cache_host_mem_available();
+        // [TAG_CACHE_LIMIT_HOLD] an entry still being written takes its pages as the worker writes them: MemAvailable does not
+        // count them yet, so they come off it (in full: conservative for one partly written)
+        const auto pending = [&]() {
+            size_t n = 0;
+            for (const auto & s : states) {
+                if (s.busy) {
+                    n += s.data.size();
+                }
+            }
+            return n;
+        };
+        const auto host_avail = [&]() {
+            const size_t a = cache_host_mem_available();
+            if (a == SIZE_MAX) {
+                return a;
+            }
+            const size_t p = pending();
+            return a > p ? a - p : 0;
+        };
+        size_t       avail = host_avail();
         auto room = [&]() {
             const size_t reuse = state_data_tgt.capacity() + state_data_dft.capacity();
             return avail == SIZE_MAX || avail + std::min(reuse, state_size_tgt + state_size_dft) >= need;
@@ -1854,7 +1880,7 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
         while (oldest_idle() != states.end() && !room()) {
             states.erase(oldest_idle());
             ++n_dropped;
-            avail = cache_host_mem_available();
+            avail = host_avail();
         }
         if (!room()) {
             SRV_WRN(" - host memory: %.0f MiB available, the entry needs %.0f MiB and %.0f MiB stay free: not saved (%zu entries dropped)\n",
@@ -1899,13 +1925,14 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
 }
 
 // [TAG_CACHE_ROOM] the same choice as load(), without touching anything
-size_t server_prompt_cache::restore_n_tokens(const server_prompt & prompt, const server_tokens & tokens_new) const {
+static std::list<server_prompt_cache_state>::const_iterator cache_restore_candidate(const std::list<server_prompt_cache_state> & states,
+        const server_prompt & prompt, const server_tokens & tokens_new) {
     const int lcp_best = prompt.tokens.get_common_prefix(tokens_new);
 
     float f_keep_best = prompt.tokens.size() > 0 ? float(lcp_best) / prompt.tokens.size() : -1.0f;
     float f_sim_best  = float(lcp_best) / tokens_new.size();
 
-    size_t n_best = 0;
+    auto it_best = states.end();
     for (auto it = states.begin(); it != states.end(); ++it) {
         if (it->busy) {
             continue;
@@ -1921,10 +1948,29 @@ size_t server_prompt_cache::restore_n_tokens(const server_prompt & prompt, const
         if (f_keep_best < f_keep_cur && f_sim_best < f_sim_cur) {
             f_keep_best = f_keep_cur;
             f_sim_best  = f_sim_cur;
-            n_best      = it->prompt.tokens.size();
+            it_best     = it;
         }
     }
-    return n_best;
+    return it_best;
+}
+
+size_t server_prompt_cache::restore_n_tokens(const server_prompt & prompt, const server_tokens & tokens_new) const {
+    const auto it = cache_restore_candidate(states, prompt, tokens_new);
+    return it != states.end() ? it->prompt.tokens.size() : 0;
+}
+
+// [TAG_CACHE_RESTORE_PIN]
+void server_prompt_cache::pin_restore(const server_prompt & prompt, const server_tokens & tokens_new) {
+    const auto it = cache_restore_candidate(states, prompt, tokens_new);
+    if (it != states.end()) {
+        const_cast<server_prompt_cache_state &>(*it).pinned = true;
+    }
+}
+
+void server_prompt_cache::unpin_all() {
+    for (auto & s : states) {
+        s.pinned = false;
+    }
 }
 
 bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot,
@@ -2021,7 +2067,7 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
 
 std::list<server_prompt_cache_state>::iterator server_prompt_cache::oldest_idle() {
     auto it = states.begin();
-    while (it != states.end() && it->busy) {
+    while (it != states.end() && (it->busy || it->pinned)) {
         ++it;
     }
     return it;

@@ -2470,6 +2470,11 @@ private:
                 const size_t  n_before = ret->prompt.tokens.size();
                 const size_t  lcp_before = ret->prompt.tokens.get_common_prefix(task.tokens);
 
+                // [TAG_CACHE_RESTORE_PIN] the entry this task restores is chosen now and pinned: the saves below (this slot's
+                // conversation, the idle ones cleared for room) used to be able to drop it as the oldest, and the task then
+                // re-read its whole prompt. Unpinned once the restore is done or skipped
+                prompt_cache->pin_restore(ret->prompt, task.tokens);
+
                 const bool saved = ret->prompt_save(*prompt_cache, &task.tokens);
 
                 // [TAG_CACHE_ROOM] a restore needs the pool to hold the entry's cells: the idle conversations shorter than it are
@@ -2525,6 +2530,7 @@ private:
                     ret->prompt_clear();
                 }
 
+                prompt_cache->unpin_all();
                 prompt_cache->update();
 
                 const size_t n_after = ret->prompt.tokens.size();

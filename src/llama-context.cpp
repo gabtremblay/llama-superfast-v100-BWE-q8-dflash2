@@ -23,6 +23,7 @@
 #include <deque>
 #include <map>
 #include <mutex>
+#include <set>
 #include <thread>
 #include <cmath>
 #include <cstring>
@@ -40,15 +41,33 @@
 // does the copies on a stream of its own, after an event the caller's thread recorded on the compute stream: per chunk of
 // at most CHUNK bytes, one launch gathers the chunk's ranges into a device staging half, one copy sends it to a pinned
 // host half, and the thread copies it into the destination while the other half's chunk crosses the link. The device
-// holds 2 x CHUNK of staging, not the state's size
+// holds 2 x CHUNK of staging, not the state's size.
+// [TAG_CACHE_BG_RS] the server holds the saving slot (no decode, pack or clearing of it), but the recurrent rows of other
+// sequences' batches move: find_slot gathers a batch's sequences into consecutive cells, swapping the cells between them,
+// and a prompt job takes the top cell. A row the save recorded could then be rewritten before the worker read it (the
+// attention cache goes first and takes seconds). The recurrent rows now go first, before any job's rest, and a row move
+// that would touch a saving sequence's row waits for them (llama_context::rs_bg_sync, from the memory's rs_bg_sync_fn)
 struct llama_bg_saver {
     static constexpr size_t CHUNK = 32ull << 20; // 2 x 32 MiB of the card's memory: the 27B's pool leaves ~0.3 GB
+    // [TAG_CACHE_BG_RS] past its recurrent rows a job goes in slices of at most this many bytes, so another job's recurrent
+    // rows wait for one slice (~0.1 s on the 3.3 GB/s link), not for a whole conversation's attention cache
+    static constexpr size_t SLICE = 8*CHUNK;
+
+    // a range of a write, split at CHUNK
+    struct piece { uint64_t src; uint8_t * dst; uint64_t n; };
 
     struct job {
-        int32_t                              ticket;
+        int32_t                              ticket  = 0;
         std::vector<llama_state_write_info>  writes;
-        ggml_backend_event_t                 ev_main; // the compute stream's work queued before the save
-        int64_t                              t0;
+        size_t                               n_front = 0;       // the first writes: recurrent rows (TAG_CACHE_BG_RS)
+        ggml_backend_event_t                 ev_main = nullptr; // the compute stream's work queued before the save
+        int64_t                              t0      = 0;
+        // the worker's progress
+        std::vector<piece>                   pieces;
+        size_t                               n_front_pieces = 0;
+        size_t                               next  = 0; // the next piece to copy
+        size_t                               bytes = 0;
+        bool                                 built = false;
     };
 
     ggml_backend_t        be       = nullptr; // its own stream on the device
@@ -57,14 +76,15 @@ struct llama_bg_saver {
     ggml_backend_event_t  ev[2]    = {};
     void *                gather   = nullptr; // ggml_backend_cuda_gather_bytes
 
-    std::thread             worker;
-    std::mutex              mtx;
-    std::condition_variable cv;
-    std::condition_variable cv_done;
-    std::deque<job>         queue;
-    std::map<int32_t, int>  status; // 0 copying, 1 done, -1 failed
-    int32_t                 next_ticket = 1;
-    bool                    stop        = false;
+    std::thread                       worker;
+    std::mutex                        mtx;
+    std::condition_variable           cv;
+    std::condition_variable           cv_done;
+    std::deque<std::shared_ptr<job>>  queue;
+    std::map<int32_t, int>            status;        // 0 copying, 1 done, -1 failed
+    std::set<int32_t>                 front_pending; // tickets whose recurrent rows are not copied yet
+    int32_t                           next_ticket = 1;
+    bool                              stop        = false;
 
     bool init(ggml_backend_dev_t dev) {
         gather = ggml_backend_reg_get_proc_address(ggml_backend_dev_backend_reg(dev), "ggml_backend_cuda_gather_bytes");
@@ -115,7 +135,10 @@ struct llama_bg_saver {
             std::lock_guard<std::mutex> lock(mtx);
             t = j.ticket = next_ticket++;
             status[t] = 0;
-            queue.push_back(std::move(j));
+            if (j.n_front > 0) {
+                front_pending.insert(t);
+            }
+            queue.push_back(std::make_shared<job>(std::move(j)));
         }
         cv.notify_all();
         return t;
@@ -125,6 +148,12 @@ struct llama_bg_saver {
     void wait(int32_t ticket) {
         std::unique_lock<std::mutex> lock(mtx);
         cv_done.wait(lock, [&] { auto it = status.find(ticket); return it == status.end() || it->second != 0; });
+    }
+
+    // [TAG_CACHE_BG_RS] returns once the ticket's recurrent rows are copied (or its copy ended)
+    void wait_front(int32_t ticket) {
+        std::unique_lock<std::mutex> lock(mtx);
+        cv_done.wait(lock, [&] { return front_pending.count(ticket) == 0; });
     }
 
     int32_t poll(int32_t ticket) {
@@ -140,29 +169,69 @@ struct llama_bg_saver {
         return r;
     }
 
+    // the job's pieces: each write split at CHUNK, the recurrent rows' first
+    static void build(job & j) {
+        for (size_t w = 0; w < j.writes.size(); ++w) {
+            const auto & wr = j.writes[w];
+            const uint64_t src = (uint64_t) (uintptr_t) ((const char *) wr.tensor->data + wr.offset);
+            for (uint64_t off = 0; off < wr.size; off += CHUNK) {
+                j.pieces.push_back({ src + off, wr.ptr + off, std::min<uint64_t>(CHUNK, wr.size - off) });
+            }
+            j.bytes += wr.size;
+            if (w + 1 == j.n_front) {
+                j.n_front_pieces = j.pieces.size();
+            }
+        }
+        j.built = true;
+    }
+
     void run() {
         for (;;) {
-            job j;
+            std::shared_ptr<job> j;
             {
                 std::unique_lock<std::mutex> lock(mtx);
                 cv.wait(lock, [this] { return stop || !queue.empty(); });
                 if (queue.empty()) {
                     return; // stop, nothing left
                 }
-                j = std::move(queue.front());
-                queue.pop_front();
+                // [TAG_CACHE_BG_RS] a job's recurrent rows go before any job's rest: the compute stream may be waiting to move them
+                auto it = std::find_if(queue.begin(), queue.end(), [this](const std::shared_ptr<job> & q) { return front_pending.count(q->ticket) != 0; });
+                j = it != queue.end() ? *it : queue.front();
             }
-            size_t bytes = 0;
-            const bool ok = copy(j, bytes);
-            if (j.ev_main) {
-                ggml_backend_event_free(j.ev_main);
+            if (!j->built) {
+                build(*j);
             }
-            const double ms = (ggml_time_us() - j.t0)/1000.0;
-            LLAMA_LOG_WARN("%s: state of ticket %d, %.1f MiB in %zu ranges: %s in %.1f ms (%.2f GB/s)\n", __func__, j.ticket,
-                    bytes/1048576.0, j.writes.size(), ok ? "copied" : "FAILED", ms, ms > 0 ? bytes/ms/1e6 : 0.0);
+            // this round: the recurrent rows, or the next slice of the rest
+            const size_t p0 = j->next;
+            size_t p1 = p0;
+            if (p0 < j->n_front_pieces) {
+                p1 = j->n_front_pieces;
+            } else {
+                for (size_t n = 0; p1 < j->pieces.size() && (p1 == p0 || n + j->pieces[p1].n <= SLICE); ++p1) {
+                    n += j->pieces[p1].n;
+                }
+            }
+            const bool ok   = copy(*j, p0, p1);
+            j->next         = p1;
+            const bool done = !ok || j->next >= j->pieces.size();
+            if (done) {
+                if (j->ev_main) {
+                    ggml_backend_event_free(j->ev_main);
+                    j->ev_main = nullptr;
+                }
+                const double ms = (ggml_time_us() - j->t0)/1000.0;
+                LLAMA_LOG_WARN("%s: state of ticket %d, %.1f MiB in %zu ranges: %s in %.1f ms (%.2f GB/s)\n", __func__, j->ticket,
+                        j->bytes/1048576.0, j->writes.size(), ok ? "copied" : "FAILED", ms, ms > 0 ? j->bytes/ms/1e6 : 0.0);
+            }
             {
                 std::lock_guard<std::mutex> lock(mtx);
-                status[j.ticket] = ok ? 1 : -1;
+                if (done || j->next >= j->n_front_pieces) {
+                    front_pending.erase(j->ticket);
+                }
+                if (done) {
+                    status[j->ticket] = ok ? 1 : -1;
+                    queue.erase(std::find(queue.begin(), queue.end(), j));
+                }
             }
             cv_done.notify_all();
         }
@@ -179,22 +248,14 @@ struct llama_bg_saver {
         return t;
     }
 
-    bool copy(const job & j, size_t & bytes) {
+    // pieces [p0, p1) of the job, through the staging halves
+    bool copy(const job & j, size_t p0, size_t p1) {
         typedef bool (*gather_fn_t)(ggml_backend_t, const uint64_t *, int, void *);
-        // the pieces: each write, split at CHUNK
-        struct piece { uint64_t src; uint8_t * dst; uint64_t n; };
-        std::vector<piece> pieces;
-        for (const auto & w : j.writes) {
-            const uint64_t src = (uint64_t) (uintptr_t) ((const char *) w.tensor->data + w.offset);
-            for (uint64_t off = 0; off < w.size; off += CHUNK) {
-                pieces.push_back({ src + off, w.ptr + off, std::min<uint64_t>(CHUNK, w.size - off) });
-            }
-            bytes += w.size;
-        }
+        const auto & pieces = j.pieces;
         // the chunks: consecutive pieces at 16-byte offsets, at most CHUNK bytes
         struct chunk { size_t first, last; size_t n_bytes; std::vector<uint64_t> ranges; };
         std::vector<chunk> chunks;
-        for (size_t i = 0; i < pieces.size(); ++i) {
+        for (size_t i = p0; i < p1; ++i) {
             const uint64_t at = chunks.empty() ? CHUNK : GGML_PAD(chunks.back().n_bytes, 16);
             if (chunks.empty() || at + pieces[i].n > CHUNK) {
                 chunks.push_back({ i, i, 0, {} });
@@ -647,6 +708,7 @@ llama_context::llama_context(
                 // the draft's work (rs_replay_one decides, once the backends exist). LLAMA_RS_REPLAY_EAGER=0/1 overrides
                 r->rs_rollback_fn  = [this](llama_seq_id s) { rs_replay_one(s); };
                 r->rs_side_sync_fn = [this]() { rs_side_sync(); };
+                r->rs_bg_sync_fn   = [this]() { rs_bg_sync(); }; // [TAG_CACHE_BG_RS]
             }
         }
     }
@@ -791,6 +853,7 @@ llama_context::~llama_context() {
             bg_saver->wait(t);
         }
         bg_tickets.clear();
+        bg_front.clear();
         bg_saver.reset();
     }
 
@@ -3321,7 +3384,7 @@ void llama_context::rs_replay_selftest(llama_seq_id s) {
     }
 }
 
-void llama_context::rs_replay_one(llama_seq_id s) {
+void llama_context::rs_replay_one(llama_seq_id s, bool force) {
     auto * h = dynamic_cast<llama_memory_hybrid *>(memory.get());
     llama_memory_recurrent * recr = h ? h->get_mem_recr() : nullptr;
     if (recr == nullptr || recr->rs_replay == 0) {
@@ -3332,7 +3395,7 @@ void llama_context::rs_replay_one(llama_seq_id s) {
         return;
     }
     static const int eager_env = getenv("LLAMA_RS_REPLAY_EAGER") != nullptr ? atoi(getenv("LLAMA_RS_REPLAY_EAGER")) : -1;
-    if (!(eager_env >= 0 ? eager_env != 0 : rs_side_init())) {
+    if (!force && !(eager_env >= 0 ? eager_env != 0 : rs_side_init())) {
         return; // the batched replay before the next decode takes it
     }
     rs_replay_selftest(s);
@@ -5941,6 +6004,18 @@ int32_t llama_context::state_seq_get_data_bg(llama_seq_id seq_id, uint8_t * dst,
         }
     }
 
+    // [TAG_CACHE_BG_RS] a rollback still to replay would rewrite the live row after the save recorded it: it replays now
+    llama_memory_recurrent * recr = nullptr;
+    if (auto * h = dynamic_cast<llama_memory_hybrid *>(memory.get())) {
+        recr = h->get_mem_recr();
+    } else {
+        recr = dynamic_cast<llama_memory_recurrent *>(memory.get());
+    }
+    if (recr != nullptr && recr->rs_replay > 0 && recr->rs_replay_pending(seq_id) >= 0) {
+        rs_replay_one(seq_id, true);
+        rs_side_sync();
+    }
+
     // the header and the metadata now; the tensor writes are recorded, not done
     std::vector<ggml_backend_t> cands = { main_be };
     std::vector<ggml_backend_t> used;
@@ -5974,20 +6049,73 @@ int32_t llama_context::state_seq_get_data_bg(llama_seq_id seq_id, uint8_t * dst,
         }
         dev_writes.push_back(w);
     }
+    // [TAG_CACHE_BG_RS] the recurrent rows first
+    const auto is_rs = [](const llama_state_write_info & w) {
+        const char * name = w.tensor->view_src ? w.tensor->view_src->name : w.tensor->name;
+        return strncmp(name, "cache_r_l", 9) == 0 || strncmp(name, "cache_s_l", 9) == 0 || strncmp(name, "cache_ple_r_l", 13) == 0;
+    };
+    const size_t n_front = std::stable_partition(dev_writes.begin(), dev_writes.end(), is_rs) - dev_writes.begin();
     ggml_backend_event_t ev_main = ggml_backend_event_new(dev);
     if (ev_main == nullptr) {
         return 0;
     }
     ggml_backend_event_record(ev_main, main_be);
-    const int32_t ticket = bg_saver->submit({ 0, std::move(dev_writes), ev_main, ggml_time_us() });
+    llama_bg_saver::job j;
+    j.writes  = std::move(dev_writes);
+    j.n_front = n_front;
+    j.ev_main = ev_main;
+    j.t0      = ggml_time_us();
+    const int32_t ticket = bg_saver->submit(std::move(j));
     bg_tickets.push_back(ticket);
+    if (n_front > 0 && recr != nullptr && (size_t) seq_id < recr->rs_bg_pin.size()) {
+        bg_front.push_back({ ticket, seq_id });
+        recr->rs_bg_pin[seq_id] = 1;
+    }
     return ticket;
+}
+
+// [TAG_CACHE_BG_RS] a row move waits for the saving sequences' recurrent rows to be copied
+void llama_context::rs_bg_sync() {
+    if (bg_front.empty() || !bg_saver) {
+        return;
+    }
+    const int64_t t0 = ggml_time_us();
+    for (const auto & f : bg_front) {
+        bg_saver->wait_front(f.first);
+    }
+    bg_front.clear();
+    rs_bg_pins_update();
+    LLAMA_LOG_WARN("%s: a recurrent row move waited %.1f ms for a background save's recurrent rows\n", __func__, (ggml_time_us() - t0)/1000.0);
+}
+
+void llama_context::rs_bg_pins_update() {
+    llama_memory_recurrent * recr = nullptr;
+    if (auto * h = dynamic_cast<llama_memory_hybrid *>(memory.get())) {
+        recr = h->get_mem_recr();
+    } else {
+        recr = dynamic_cast<llama_memory_recurrent *>(memory.get());
+    }
+    if (recr == nullptr) {
+        return;
+    }
+    std::fill(recr->rs_bg_pin.begin(), recr->rs_bg_pin.end(), 0);
+    for (const auto & f : bg_front) {
+        if ((size_t) f.second < recr->rs_bg_pin.size()) {
+            recr->rs_bg_pin[f.second] = 1;
+        }
+    }
 }
 
 int32_t llama_context::state_seq_bg_poll(int32_t ticket) {
     const int32_t r = bg_saver ? bg_saver->poll(ticket) : -1;
     if (r != 0) {
         bg_tickets.erase(std::remove(bg_tickets.begin(), bg_tickets.end(), ticket), bg_tickets.end());
+        // [TAG_CACHE_BG_RS] its recurrent rows are copied: the sequence's rows may move again
+        const size_t n = bg_front.size();
+        bg_front.erase(std::remove_if(bg_front.begin(), bg_front.end(), [&](const std::pair<int32_t, llama_seq_id> & f) { return f.first == ticket; }), bg_front.end());
+        if (bg_front.size() != n) {
+            rs_bg_pins_update();
+        }
     }
     return r;
 }

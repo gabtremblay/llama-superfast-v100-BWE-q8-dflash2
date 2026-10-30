@@ -99,6 +99,11 @@ public:
     std::function<void(llama_seq_id)> rs_rollback_fn;
     // [TAG_RS_REPLAY_SIDE] the host waits for a replay in flight on the side stream before it copies or reads rows
     std::function<void()> rs_side_sync_fn;
+    // [TAG_CACHE_BG_RS] a background save reads these sequences' rows later, on its own stream: a row move that would rewrite
+    // one first waits for the save's recurrent rows (rs_bg_sync_fn, set by the context)
+    std::vector<uint8_t>  rs_bg_pin; // per seq
+    std::function<void()> rs_bg_sync_fn;
+    void rs_bg_guard(int32_t c0, int32_t c1); // waits when a pinned sequence's cell is in [c0, c1)
     uint32_t rs_bak_row(llama_seq_id seq_id) const { return size + (uint32_t) seq_id; }
     uint32_t rs_ring_zero_row() const { return rs_replay * n_seq_max; } // the ring's last row, all zero: a pad token
     int32_t  seq_cell(llama_seq_id seq_id) const { return seq_id >= 0 && (uint32_t) seq_id < size ? cells[seq_id].tail : -1; }

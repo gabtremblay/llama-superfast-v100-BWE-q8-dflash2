@@ -515,7 +515,7 @@ private:
     // [TAG_RS_REPLAY] the pending rollbacks of the batch's sequences, replayed before its graphs; rs_replay runs one replay
     // graph (k tokens of seq_id's ring from its kept state into dst_row) on its own scheduler
     void rs_replay_pending(const llama_batch & b);
-    void rs_replay_one(llama_seq_id s); // eager, from seq_rm
+    void rs_replay_one(llama_seq_id s, bool force = false); // eager, from seq_rm (force: a background save's, TAG_CACHE_BG_RS)
     void rs_replay_selftest(llama_seq_id s); // LLAMA_RS_REPLAY_SELFTEST=1, before a replay
     bool rs_replay(llama_seq_id seq_id, uint32_t k, uint32_t dst_row);
     // the batched form: sequence seqs[i] replays ks[i] tokens into dst_rows[i], all in one graph (the shorter ones padded)
@@ -766,5 +766,9 @@ private:
     // context submitted that are not polled done (waited for before the context frees what they read)
     std::shared_ptr<struct llama_bg_saver> bg_saver;
     std::vector<int32_t>                   bg_tickets;
+    // [TAG_CACHE_BG_RS] (ticket, sequence) of the saves whose recurrent rows are not known to be copied yet
+    std::vector<std::pair<int32_t, llama_seq_id>> bg_front;
+    void rs_bg_sync();
+    void rs_bg_pins_update();
     bool bg_off = false; // set once the saver is found unavailable
 };

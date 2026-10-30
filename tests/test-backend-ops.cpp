@@ -12294,6 +12294,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                                                                 GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, nh_perm.second));
             }
         }
+        // [TAG_GQA6_KV_BUDGET] short calls over more keys than one block of the F16 K/V budget (16,384 keys at 4 KV heads)
+        for (int64_t nb : {17, 64}) {
+            test_cases.emplace_back(new test_flash_attn_ext(256, 256, nh_perm.first, {6, 1}, 40960, nb, true, false, 0, 0, GGML_PREC_F32,
+                                                            GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, nh_perm.second));
+        }
     }
     // the verify, draft-step and decode call at depth (1 to 16 tokens, 4 KV heads x gqa 6, D 256): the streaming kernel on an F16
     // and on a Q8_0 cache in the cache's own layout (permute 0213), on one KV stream and on two (the non-unified cache of
@@ -12721,10 +12726,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
             }
         }
     }
-    // a deep conversation's prompt append on the Q8_0 cache (the 6-head route): a micro-batch and its 1,024-token chunk at
-    // 32k, 96k and 168k keys
+    // a deep conversation's prompt append on the Q8_0 cache (the 6-head route): short appends (TAG_GQA6_KV_BUDGET), a
+    // micro-batch and its 1,024-token chunk at 32k, 96k and 168k keys
     for (int64_t kv : {32768, 98304, 172032}) {
-        for (int64_t nb : {1024, 2048}) {
+        for (int64_t nb : {17, 32, 128, 1024, 2048}) {
             test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32,
                                                             GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 2, 1, 3}));
         }
