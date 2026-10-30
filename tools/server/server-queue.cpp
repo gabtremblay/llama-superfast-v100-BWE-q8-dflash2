@@ -87,6 +87,16 @@ int server_queue::get_new_id() {
     return new_id;
 }
 
+void server_queue::pop_deferred_all() {
+    std::unique_lock<std::mutex> lock(mutex_tasks);
+    while (!queue_tasks_deferred.empty()) {
+        queue_tasks.emplace_front(std::move(queue_tasks_deferred.back()));
+        queue_tasks_deferred.pop_back();
+    }
+    time_last_task = ggml_time_ms();
+    condition_tasks.notify_one();
+}
+
 void server_queue::pop_deferred_task(int id_slot) {
     std::unique_lock<std::mutex> lock(mutex_tasks);
     if (!queue_tasks_deferred.empty()) {

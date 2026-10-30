@@ -184,6 +184,9 @@ struct llama_context {
 
     // [TAG_CACHE_BG_SAVE] llama_state_seq_get_data_bg / llama_state_seq_bg_poll
     int32_t state_seq_get_data_bg(llama_seq_id seq_id, uint8_t * dst, size_t size);
+    // [TAG_CACHE_BG_RESTORE] llama_state_seq_set_data_bg
+    int32_t state_seq_set_data_bg(llama_seq_id seq_id, const uint8_t * src, size_t size);
+    bool    bg_saver_get(ggml_backend_dev_t dev);
     int32_t state_seq_bg_poll(int32_t ticket);
 
     // [TAG_CKPT_STAGE] queues an async state get's tensor writes through the staging buffer; false: not staged, nothing queued

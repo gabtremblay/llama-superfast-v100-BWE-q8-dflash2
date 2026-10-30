@@ -514,3 +514,38 @@ An outside review of 59a46eb found four problems; each held up in the code and i
 - **The cache limit did not hold while the remaining entries were being written** (`TAG_CACHE_LIMIT_HOLD`). With no
   idle entry left to drop, the new entry went in over the limit; it is now skipped. The host-memory check also takes
   the entries still being written off `MemAvailable` (their pages are not resident yet).
+
+## 23. The remaining saves and the restore in the background
+
+Section 20 moved the save of a conversation cleared for room to the background. Three copies still stopped the device
+for every slot: the save of a slot's conversation when a task replaces it, the saves of the idle conversations cleared
+so a restore fits, and the restore itself. All three now run on the saver's worker, and the task that needs them waits
+(deferred) while the other slots go on.
+
+- **The replacement save** (`TAG_CACHE_BG_REPLACE`) runs in the background and holds the slot, which keeps its
+  conversation (the task may reuse a prefix): the checkpoints past the common prefix move into the entry, the newest
+  others are copied, as before. The task is deferred; when the copy ends it comes back, finds the conversation in the
+  cache and goes on.
+- **The saves that make room for a restore** run in the background too; the task waits for their cells.
+- **The restore** (`TAG_CACHE_BG_RESTORE`, `llama_state_seq_set_data_bg`): the entry's metadata are read and its cells and
+  rows claimed at once (7.5 ms for a 32k-token conversation), then the worker copies its bytes into a pinned half, sends
+  it to a device half and scatters it to the cells and rows in one launch (`ggml_cuda_scatter_bytes`), the next chunk
+  staged meanwhile; recurrent rows first and pinned against row moves (`TAG_CACHE_BG_RS`). The slot is held until the
+  copy ends, the entry busy until then and dropped after.
+- When a background save or restore ends, every deferred task goes back to the queue (`server_queue::pop_deferred_all`),
+  and the loop keeps polling while one runs even with every slot idle.
+- `LLAMA_CACHE_BG_SAVE=0` keeps the saves synchronous, `LLAMA_CACHE_BG_RESTORE=0` the restore. `LLAMA_CACHE_BG_VERIFY=1`
+  now also checks a restored state against its entry's bytes, background or synchronous (an entry from another slot
+  differs only in the sequence id of each cell's metadata, which the check allows).
+
+Measured on the dev build (three slots on a 65,536-token pool, `bgrestore_probe.py`): a 32k-token conversation comes back
+while another slot streams; its slot's 20k-token conversation is saved, a second idle 20k one is cleared for room, then
+it is restored.
+
+| | Before | After |
+|---|---|---|
+| Longest pause of the streaming slot | 1,706 ms | 354 ms |
+| The returning conversation's request | 2.1 s | 2.8 s (it waits for each copy in turn) |
+| Main thread for the restore | the whole copy | 7.5 ms (the copy: 1.25 GB in ~0.8 s, 1.65 GB/s) |
+
+Every background save and both restores, target and draft, were identical to their synchronous counterparts.

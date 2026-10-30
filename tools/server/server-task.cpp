@@ -1959,6 +1959,11 @@ size_t server_prompt_cache::restore_n_tokens(const server_prompt & prompt, const
     return it != states.end() ? it->prompt.tokens.size() : 0;
 }
 
+server_prompt_cache_state * server_prompt_cache::restore_candidate(const server_prompt & prompt, const server_tokens & tokens_new) {
+    const auto it = cache_restore_candidate(states, prompt, tokens_new);
+    return it != states.end() ? &const_cast<server_prompt_cache_state &>(*it) : nullptr;
+}
+
 // [TAG_CACHE_RESTORE_PIN]
 void server_prompt_cache::pin_restore(const server_prompt & prompt, const server_tokens & tokens_new) {
     const auto it = cache_restore_candidate(states, prompt, tokens_new);

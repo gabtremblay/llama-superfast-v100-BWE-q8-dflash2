@@ -1235,6 +1235,18 @@ static bool ggml_backend_cuda_gather_bytes(ggml_backend_t backend, const uint64_
     return true;
 }
 
+// [TAG_CACHE_BG_RESTORE] the inverse of ggml_backend_cuda_gather_bytes: ranges [n][3] = destination address, offset in src, bytes
+static bool ggml_backend_cuda_scatter_bytes(ggml_backend_t backend, const uint64_t * ranges, int n, const void * src) {
+    if (backend == nullptr || !ggml_backend_is_cuda(backend) || n < 0 || (n > 0 && (ranges == nullptr || src == nullptr))) {
+        return false;
+    }
+    ggml_backend_cuda_context * ctx = (ggml_backend_cuda_context *) backend->context;
+    GGML_RT_SCOPE("cuda.scatter_bytes");
+    ggml_cuda_set_device(ctx->device);
+    ggml_cuda_scatter_bytes(*ctx, ranges, n, (const char *) src);
+    return true;
+}
+
 static void ggml_backend_cuda_upload_sync(ggml_tensor * tensor) {
     ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buf->context;
@@ -9458,6 +9470,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_cuda_gather_bytes") == 0) {
         return (void *)ggml_backend_cuda_gather_bytes;
+    }
+    if (strcmp(name, "ggml_backend_cuda_scatter_bytes") == 0) {
+        return (void *)ggml_backend_cuda_scatter_bytes;
     }
     if (strcmp(name, "ggml_backend_cuda_fattn_stream_limits") == 0) {
         return (void *)ggml_cuda_fattn_verify_stream_limits;

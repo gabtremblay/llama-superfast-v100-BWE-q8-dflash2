@@ -122,3 +122,36 @@ void ggml_cuda_gather_bytes(ggml_backend_cuda_context & ctx, const uint64_t * ra
     gather_bytes_kernel<<<blocks, 256, 0, stream>>>(d_ranges.get(), n, dst);
     CUDA_CHECK(cudaGetLastError());
 }
+
+// [TAG_CACHE_BG_RESTORE] a block a range (blocks stride over the ranges), as gather_bytes_kernel
+static __global__ void scatter_bytes_kernel(const uint64_t * __restrict__ ranges, const int n, const char * __restrict__ src) {
+    for (int r = blockIdx.x; r < n; r += gridDim.x) {
+        char *         d    = (char *) ranges[3*r + 0];
+        const char *   s    = src + ranges[3*r + 1];
+        const uint64_t size = ranges[3*r + 2];
+        if (((uintptr_t) s | (uintptr_t) d | size) % 16 == 0) {
+            const int4 * s4 = (const int4 *) s;
+            int4 *       d4 = (int4 *) d;
+            for (uint64_t i = threadIdx.x; i < size/16; i += blockDim.x) {
+                d4[i] = s4[i];
+            }
+        } else {
+            for (uint64_t i = threadIdx.x; i < size; i += blockDim.x) {
+                d[i] = s[i];
+            }
+        }
+    }
+}
+
+void ggml_cuda_scatter_bytes(ggml_backend_cuda_context & ctx, const uint64_t * ranges, int n, const char * src) {
+    if (n <= 0) {
+        return;
+    }
+    cudaStream_t stream = ctx.stream();
+    ggml_cuda_pool_alloc<uint64_t> d_ranges(ctx.pool(), (size_t) 3*n);
+    CUDA_CHECK(cudaMemcpyAsync(d_ranges.get(), ranges, (size_t) 3*n*sizeof(uint64_t), cudaMemcpyHostToDevice, stream));
+    const int nsm    = ggml_cuda_info().devices[ctx.device].nsm;
+    const int blocks = std::min(n, 4*nsm);
+    scatter_bytes_kernel<<<blocks, 256, 0, stream>>>(d_ranges.get(), n, src);
+    CUDA_CHECK(cudaGetLastError());
+}

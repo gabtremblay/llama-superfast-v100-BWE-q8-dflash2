@@ -694,6 +694,8 @@ struct server_prompt_cache {
 
     // [TAG_CACHE_RESTORE_PIN] pins the entry load() would restore (see restore_n_tokens); unpin_all releases every pin
     void pin_restore(const server_prompt & prompt, const server_tokens & tokens_new);
+    // [TAG_CACHE_BG_RESTORE] the entry load() would restore (nullptr: none)
+    server_prompt_cache_state * restore_candidate(const server_prompt & prompt, const server_tokens & tokens_new);
     void unpin_all();
 
     // [TAG_CACHE_BG_SAVE] the oldest entry not being written nor pinned (states.end() when there is none)

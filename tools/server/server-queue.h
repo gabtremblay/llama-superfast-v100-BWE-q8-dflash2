@@ -66,6 +66,10 @@ public:
     // prioritize tasks that use the specified slot (otherwise, pop the first deferred task)
     void pop_deferred_task(int id_slot);
 
+    // [TAG_CACHE_BG_RESTORE] every deferred task back to the front of the queue, in order (a background save or restore ended:
+    // the task that waited for it is among them)
+    void pop_deferred_all();
+
     // if sleeping, request exiting sleep state and wait until it is done
     // returns immediately if not sleeping
     void wait_until_no_sleep();

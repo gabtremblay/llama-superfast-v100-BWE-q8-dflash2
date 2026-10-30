@@ -18,3 +18,7 @@ void ggml_cuda_kv_move_rows(ggml_backend_cuda_context & ctx, const kv_move_tenso
 // [TAG_CACHE_BG_SAVE] byte ranges gathered into one device buffer in one launch: ranges [n][3] = source address, offset in dst,
 // bytes. The ranges must not overlap dst
 void ggml_cuda_gather_bytes(ggml_backend_cuda_context & ctx, const uint64_t * ranges, int n, char * dst);
+
+// [TAG_CACHE_BG_RESTORE] the inverse: a device buffer's byte ranges scattered to their places in one launch: ranges [n][3] =
+// destination address, offset in src, bytes. The ranges must not overlap src
+void ggml_cuda_scatter_bytes(ggml_backend_cuda_context & ctx, const uint64_t * ranges, int n, const char * src);

@@ -1057,6 +1057,17 @@ extern "C" {
     // 1: the bytes are in dst; 0: still copying; -1: failed or unknown ticket (dst holds nothing usable)
     LLAMA_API int32_t llama_state_seq_bg_poll(struct llama_context * ctx, int32_t ticket);
 
+    // [TAG_CACHE_BG_RESTORE] the inverse of llama_state_seq_get_data_bg: the metadata and the sequence's cells are set before it
+    // returns, the tensor bytes by the worker. Returns a ticket (> 0, polled with llama_state_seq_bg_poll), 0 when the state
+    // cannot be restored this way (nothing done: restore it with llama_state_seq_set_data_ext), -2 when it was restored
+    // synchronously, -1 when it failed (the sequence is cleared). The sequence must not be decoded or read, nor src freed,
+    // until the poll returns non-zero
+    LLAMA_API int32_t llama_state_seq_set_data_bg(
+            struct llama_context * ctx,
+                   const uint8_t * src,
+                          size_t   size,
+                    llama_seq_id   seq_id);
+
     //
     // Decoding
     //

@@ -319,10 +319,21 @@ struct server_slot {
     bool                        bg_failed = false;
     server_prompt_cache_state * bg_entry  = nullptr;
     int64_t                     bg_t0     = 0;
+    // [TAG_CACHE_BG_REPLACE] the save is the slot's own conversation before a task replaces it: the slot keeps it after
+    bool                        bg_keep   = false;
 
-    // held by a job or by a background save: no task, pack, clearing or restore takes it
+    // [TAG_CACHE_BG_RESTORE] a prompt-cache entry being restored into the slot in the background (prompt_load_bg): the slot
+    // holds its prompt already, its cells and rows are being written; it takes no task and is not packed or cleared until
+    // prompt_load_poll sees the copy done
+    bool                        bg_restoring   = false;
+    int32_t                     bg_rticket     = 0;
+    int32_t                     bg_rticket_dft = 0;
+    server_prompt_cache_state * bg_rentry      = nullptr;
+    int64_t                     bg_rt0         = 0;
+
+    // held by a job or by a background save or restore: no task, pack, clearing or restore takes it
     bool held() const {
-        return tu_owned || bg_saving;
+        return tu_owned || bg_saving || bg_restoring;
     }
 
     // the cached prefix a not-started task's start will reuse, computed once per task (tu_remaining)
@@ -438,7 +449,9 @@ struct server_slot {
     // state and its checkpoints (moved, not copied: the slot is cleared after) are filled now, its target state by
     // llama_state_seq_get_data_bg. Returns 2 while that copy runs (bg_saving, the entry busy; prompt_save_poll clears the slot
     // when it is done), 1 when the state was saved synchronously instead (the caller clears the slot), 0 when not saved
-    int prompt_save_bg(server_prompt_cache & prompt_cache) {
+    // [TAG_CACHE_BG_REPLACE] next: the prompt about to replace the slot's (as prompt_save): the slot keeps its conversation when
+    // the copy ends, the checkpoints past the common prefix move into the entry and the newest others are copied
+    int prompt_save_bg(server_prompt_cache & prompt_cache, const server_tokens * next = nullptr) {
         static const size_t min_tokens = [] {
             const char * e = getenv("LLAMA_CACHE_MIN_TOKENS");
             return (size_t) (e ? std::max(0, atoi(e)) : 8192);
@@ -480,11 +493,18 @@ struct server_slot {
         const int64_t t3 = ggml_time_us();
         cur->data.spec = std::move(cur_spec);
 
-        // [TAG_CACHE_CKPT_KEEP] the newest checkpoints move into the entry: the slot is cleared once the state is in
+        // [TAG_CACHE_CKPT_KEEP] the newest checkpoints move into the entry: the slot is cleared once the state is in. A
+        // replacement save (next) moves those its next prompt cannot use and copies the others, as prompt_save
         const int64_t ckpt_min = server_prompt_cache_ckpt_min(prompt.checkpoints);
+        const int64_t lcp      = next ? (int64_t) prompt.tokens.get_common_prefix(*next) : -1;
         size_t n_moved = 0;
         for (auto it = prompt.checkpoints.begin(); it != prompt.checkpoints.end();) {
             if (it->n_tokens < ckpt_min) {
+                ++it;
+                continue;
+            }
+            if (next && it->n_tokens <= lcp) {
+                cur->prompt.checkpoints.push_back(*it);
                 ++it;
                 continue;
             }
@@ -507,6 +527,7 @@ struct server_slot {
         bg_failed     = false;
         bg_entry      = cur;
         bg_t0         = t0;
+        bg_keep       = next != nullptr;
         return 2;
     }
 
@@ -553,16 +574,162 @@ struct server_slot {
                 prompt_cache->states.remove_if([e](const server_prompt_cache_state & st) { return &st == e; });
             }
         }
-        SLT_WRN(*this, "prompt saved in the background: %zu tokens, %.1f ms after the save began%s\n", prompt.tokens.size(),
-                (ggml_time_us() - bg_t0) / 1e3, r > 0 ? "" : ", the copy FAILED (not cached)");
+        SLT_WRN(*this, "prompt saved in the background: %zu tokens, %.1f ms after the save began%s%s\n", prompt.tokens.size(),
+                (ggml_time_us() - bg_t0) / 1e3, r > 0 ? "" : ", the copy FAILED (not cached)", bg_keep ? ", the slot keeps it" : "");
         bg_saving = false;
         bg_ticket = 0;
         bg_entry  = nullptr;
-        prompt_clear();
+        if (!bg_keep) {
+            prompt_clear();
+        }
+        bg_keep = false;
+        return true;
+    }
+
+    // [TAG_CACHE_BG_RESTORE] prompt_load without stopping the device: the entry load() would restore is chosen now, its cells
+    // and rows are set and the slot takes its prompt; the bytes cross the link on the saver's worker. Returns 2 while that
+    // copy runs (bg_restoring: the slot is held, the entry busy until prompt_load_poll), 1 when it was restored synchronously
+    // or there was nothing to restore (as prompt_load), 0 when the restore failed (the caller clears the slot)
+    int prompt_load_bg(server_prompt_cache & prompt_cache, const server_tokens & tokens) {
+        server_prompt_cache_state * e = prompt_cache.restore_candidate(prompt, tokens);
+        if (e == nullptr) {
+            return prompt_load(prompt_cache, tokens) ? 1 : 0;
+        }
+        const int64_t t0 = ggml_time_us();
+        int32_t t = llama_state_seq_set_data_bg(ctx_tgt, e->data.main.data(), e->data.main.size(), id);
+        if (t == 0) {
+            return prompt_load(prompt_cache, tokens) ? 1 : 0;
+        }
+        if (t == -1) {
+            SLT_WRN(*this, "%s", "failed to restore the prompt in the background\n");
+            return 0;
+        }
+        int32_t td = 0;
+        if (ctx_dft && !e->data.drft.empty()) {
+            td = llama_state_seq_set_data_bg(ctx_dft, e->data.drft.data(), e->data.drft.size(), id);
+            if (td == 0) {
+                const size_t n = llama_state_seq_set_data_ext(ctx_dft, e->data.drft.data(), e->data.drft.size(), id, 0);
+                td = n == e->data.drft.size() ? -2 : -1;
+            }
+            if (td == -1) {
+                SLT_WRN(*this, "%s", "failed to restore the draft's state in the background\n");
+                if (t > 0) {
+                    llama_state_seq_bg_poll_wait(t);
+                }
+                return 0;
+            }
+        }
+        t  = std::max(t, 0);  // -2: restored synchronously
+        td = std::max(td, 0);
+        // the slot takes the entry's prompt: its tokens cloned (the entry stays, busy, until its bytes are in), its checkpoints moved
+        prompt.tokens      = e->prompt.tokens.clone();
+        prompt.checkpoints = std::move(e->prompt.checkpoints);
+        e->prompt.checkpoints.clear();
+        common_speculative_set_state(spec, id, e->data.spec);
+        if (t == 0 && td == 0) {
+            prompt_cache.states.remove_if([e](const server_prompt_cache_state & st) { return &st == e; });
+            return 1;
+        }
+        e->busy        = true;
+        bg_restoring   = true;
+        bg_rticket     = t;
+        bg_rticket_dft = td;
+        bg_rentry      = e;
+        bg_rt0         = t0;
+        SLT_WRN(*this, "prompt restoring in the background: %zu tokens, %.1f ms on the main thread (%.1f MiB)\n", prompt.tokens.size(),
+                (ggml_time_us() - t0) / 1e3, (e->data.main.size() + e->data.drft.size()) / 1048576.0);
+        return 2;
+    }
+
+    // LLAMA_CACHE_BG_VERIFY=1: a restored state against its entry's bytes, past the header (magic, sequence id). An entry saved
+    // from another slot names that slot's sequence in every cell's metadata, which the restore renames: a byte that reads the
+    // entry's sequence there and this slot's here is not a difference. A mismatch logs its first differing byte and how many differ
+    void restore_verify(const char * how, const char * name, llama_context * ctx, const server_state_bytes & data) {
+        std::vector<uint8_t> ref(data.size());
+        const size_t n   = llama_state_seq_get_data_ext(ctx, ref.data(), ref.size(), id, LLAMA_STATE_SEQ_FLAGS_NONE);
+        const size_t hdr = sizeof(uint32_t) + sizeof(llama_seq_id);
+        const uint8_t seq_from = data.size() > hdr ? data[sizeof(uint32_t)] : 0; // the low byte of the entry's sequence id
+        size_t first = SIZE_MAX, n_diff = 0;
+        for (size_t i = hdr; i < std::min(n, data.size()); ++i) {
+            if (ref[i] != data[i] && !(data[i] == seq_from && ref[i] == (uint8_t) id)) {
+                first = std::min(first, i);
+                ++n_diff;
+            }
+        }
+        if (n == data.size() && n_diff == 0) {
+            SLT_WRN(*this, "%s restore verify, %s: %.1f MiB against the entry: identical\n", how, name, n / 1048576.0);
+        } else {
+            SLT_WRN(*this, "%s restore verify, %s: %.1f MiB against the entry: MISMATCH (size %zu vs %zu, first byte %zu, %zu bytes differ)\n",
+                    how, name, data.size() / 1048576.0, n, data.size(), first, n_diff);
+        }
+    }
+
+    // waits for a ticket of the target's (a failed draft restore after the target's began)
+    void llama_state_seq_bg_poll_wait(int32_t t) {
+        while (llama_state_seq_bg_poll(ctx_tgt, t) == 0) {
+            std::this_thread::sleep_for(std::chrono::microseconds(200));
+        }
+    }
+
+    // [TAG_CACHE_BG_RESTORE] true when the background restore ended: the entry is dropped (its conversation is the slot's), or
+    // on a failed copy kept and the slot cleared. LLAMA_CACHE_BG_VERIFY=1 compares the restored state with the entry's bytes
+    bool prompt_load_poll(server_prompt_cache * prompt_cache) {
+        if (!bg_restoring) {
+            return false;
+        }
+        bool failed = false;
+        for (auto [ctx, t] : { std::pair<llama_context *, int32_t *>{ ctx_tgt, &bg_rticket }, { ctx_dft, &bg_rticket_dft } }) {
+            if (*t > 0) {
+                const int32_t r = llama_state_seq_bg_poll(ctx, *t);
+                if (r != 0) {
+                    failed = failed || r < 0;
+                    *t = 0;
+                } else {
+                    return false;
+                }
+            }
+        }
+        server_prompt_cache_state * e = bg_rentry;
+        static const bool verify = [] { const char * v = getenv("LLAMA_CACHE_BG_VERIFY"); return v != nullptr && atoi(v) != 0; }();
+        if (!failed && verify) {
+            for (auto [ctx, data, name] : { std::tuple<llama_context *, server_state_bytes *, const char *>{ ctx_tgt, &e->data.main, "target" },
+                                            { ctx_dft, &e->data.drft, "draft" } }) {
+                if (ctx == nullptr || data->empty()) {
+                    continue;
+                }
+                restore_verify("background", name, ctx, *data);
+            }
+        }
+        SLT_WRN(*this, "prompt restored in the background: %zu tokens, %.1f ms after the restore began%s\n", prompt.tokens.size(),
+                (ggml_time_us() - bg_rt0) / 1e3, failed ? ", the copy FAILED (the slot is cleared, the entry kept)" : "");
+        if (prompt_cache) {
+            if (!failed) {
+                prompt_cache->states.remove_if([e](const server_prompt_cache_state & st) { return &st == e; });
+            } else {
+                e->prompt.checkpoints = std::move(prompt.checkpoints);
+                e->busy = false;
+            }
+        }
+        bg_restoring = false;
+        bg_rentry    = nullptr;
+        if (failed) {
+            prompt_clear();
+        }
         return true;
     }
 
     bool prompt_load(server_prompt_cache & prompt_cache, const server_tokens & tokens) {
+        // LLAMA_CACHE_BG_VERIFY=1: the synchronous restore checked as the background one (restore_verify; the load clears the
+        // entry's bytes, so they are compared from a copy)
+        static const bool verify = [] { const char * v = getenv("LLAMA_CACHE_BG_VERIFY"); return v != nullptr && atoi(v) != 0; }();
+        server_state_bytes ref_tgt;
+        server_state_bytes ref_dft;
+        if (verify) {
+            if (server_prompt_cache_state * e = prompt_cache.restore_candidate(prompt, tokens)) {
+                ref_tgt = e->data.main;
+                ref_dft = e->data.drft;
+            }
+        }
         // an entry loaded into this slot (any slot) brings its speculative state, or resets it
         bool loaded = false;
         std::vector<uint8_t> entry_spec;
@@ -571,6 +738,12 @@ struct server_slot {
             SLT_WRN(*this, "%s", "failed to load prompt from cache\n");
         } else if (loaded) {
             common_speculative_set_state(spec, id, entry_spec);
+            if (verify && !ref_tgt.empty()) {
+                restore_verify("synchronous", "target", ctx_tgt, ref_tgt);
+                if (ctx_dft && !ref_dft.empty()) {
+                    restore_verify("synchronous", "draft", ctx_dft, ref_dft);
+                }
+            }
         }
 
         return res;
@@ -2475,7 +2648,16 @@ private:
                 // re-read its whole prompt. Unpinned once the restore is done or skipped
                 prompt_cache->pin_restore(ret->prompt, task.tokens);
 
-                const bool saved = ret->prompt_save(*prompt_cache, &task.tokens);
+                // [TAG_CACHE_BG_REPLACE] the slot's conversation is saved in the background: the slot is held (the caller defers the
+                // task) and keeps it; when the copy ends the task comes back, finds it in the cache and goes on
+                const int  sv_own = ret->prompt_save_bg(*prompt_cache, &task.tokens);
+                const bool saved  = sv_own > 0;
+                if (sv_own == 2) {
+                    prompt_cache->unpin_all();
+                    LOG_WRN("[scheduler] prompt_cache: t_us=%" PRId64 " slot=%d saving=%zu tokens in the background before task %d replaces them\n",
+                            ggml_time_us(), ret->id, n_before, task.id);
+                    return ret;
+                }
 
                 // [TAG_CACHE_ROOM] a restore needs the pool to hold the entry's cells: the idle conversations shorter than it are
                 // cleared (saved first, the least recently used first) until it fits, then the idle conversations pack down so
@@ -2498,14 +2680,25 @@ private:
                         }
                         std::sort(idle.begin(), idle.end(), [](const server_slot * a, const server_slot * b) { return a->t_last_used < b->t_last_used; });
                         size_t n_cleared = 0;
+                        size_t n_pending = 0; // [TAG_CACHE_BG_REPLACE] the cells of the ones being saved in the background
                         for (server_slot * s : idle) {
-                            if ((size_t) n_free + n_own >= n_entry) {
+                            if ((size_t) n_free + n_own + n_pending >= n_entry) {
                                 break;
                             }
                             n_cleared += s->prompt.tokens.size();
-                            s->prompt_save(*prompt_cache);
-                            s->prompt_clear();
+                            if (s->prompt_save_bg(*prompt_cache) == 2) {
+                                n_pending += s->prompt.tokens.size(); // the slot clears itself when its copy ends
+                            } else {
+                                s->prompt_clear();
+                            }
                             n_free = llama_kv_n_free(ctx_tgt);
+                        }
+                        // still short while those copies run: the task waits for their cells (deferred), the other slots go on
+                        if (n_pending > 0 && (size_t) n_free + n_own < n_entry) {
+                            prompt_cache->unpin_all();
+                            LOG_WRN("[scheduler] cache_restore_room: t_us=%" PRId64 " slot=%d entry=%zu tokens, free=%u + own %zu, saving %zu in the background: task %d waits\n",
+                                    ggml_time_us(), ret->id, n_entry, n_free, n_own, n_pending, task.id);
+                            return nullptr;
                         }
                         restore = (size_t) n_free + n_own >= n_entry;
                         uint32_t n_packed = 0;
@@ -2526,8 +2719,17 @@ private:
                     }
                 }
 
-                if (restore && !ret->prompt_load(*prompt_cache, task.tokens)) {
-                    ret->prompt_clear();
+                if (restore) {
+                    // [TAG_CACHE_BG_RESTORE] in the background: the slot is held (the caller defers the task) until the bytes are in
+                    const int lr = ret->prompt_load_bg(*prompt_cache, task.tokens);
+                    if (lr == 0) {
+                        ret->prompt_clear();
+                    } else if (lr == 2) {
+                        prompt_cache->unpin_all();
+                        LOG_WRN("[scheduler] prompt_cache: t_us=%" PRId64 " slot=%d restoring=%zu tokens in the background for task %d\n",
+                                ggml_time_us(), ret->id, ret->prompt.tokens.size(), task.id);
+                        return ret;
+                    }
                 }
 
                 prompt_cache->unpin_all();
@@ -3423,7 +3625,7 @@ private:
                         // if requested slot is unavailable, we defer this task for processing later
                         LOG_WRN("[scheduler] task_deferred: t_us=%" PRId64 " id_task=%d req_id_slot=%d slot=%d reason=%s task_tokens=%d\n",
                                 ggml_time_us(), id_task, task.id_slot, slot->id,
-                                slot->bg_saving ? "slot_bg_saving" : slot->tu_owned ? "slot_tu_owned" : "slot_processing", task.n_tokens());
+                                slot->bg_saving ? "slot_bg_saving" : slot->bg_restoring ? "slot_bg_restoring" : slot->tu_owned ? "slot_tu_owned" : "slot_processing", task.n_tokens());
                         SRV_DBG("requested slot is unavailable, defer task, id_task = %d\n", id_task);
                         queue_tasks.defer(std::move(task));
                         break;
@@ -4650,12 +4852,28 @@ private:
     void update_slots() {
         GGML_RT_SCOPE("srv.update_slots");
 
-        // [TAG_CACHE_BG_SAVE] the background saves that ended: their slots are cleared
+        // [TAG_CACHE_BG_SAVE] the background saves that ended: their slots are cleared. [TAG_CACHE_BG_RESTORE] the restores that
+        // ended: their slots are free. A task deferred for either goes back to the queue
         n_bg_saving = 0;
+        bool bg_ended = false;
         for (auto & s : slots) {
-            if (s.bg_saving && !s.prompt_save_poll(prompt_cache.get())) {
-                ++n_bg_saving;
+            if (s.bg_saving) {
+                if (s.prompt_save_poll(prompt_cache.get())) {
+                    bg_ended = true;
+                } else {
+                    ++n_bg_saving;
+                }
             }
+            if (s.bg_restoring) {
+                if (s.prompt_load_poll(prompt_cache.get())) {
+                    bg_ended = true;
+                } else {
+                    ++n_bg_saving;
+                }
+            }
+        }
+        if (bg_ended) {
+            queue_tasks.pop_deferred_all();
         }
 #ifdef DEBUG_TIMINGS
         static int64_t t_prev = 0;
@@ -4685,6 +4903,14 @@ private:
                 SRV_TRC("%s", "all slots are idle\n");
 
                 metrics_flush_idle();
+
+                // [TAG_CACHE_BG_RESTORE] a task deferred for a background save or restore: the loop comes back to poll it
+                if (n_bg_saving > 0) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                    server_task task(SERVER_TASK_TYPE_NEXT_RESPONSE);
+                    task.id = queue_tasks.get_new_id();
+                    queue_tasks.post(std::move(task));
+                }
 
                 return; // skip further processing
 
