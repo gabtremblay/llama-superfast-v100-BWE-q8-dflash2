@@ -549,3 +549,22 @@ it is restored.
 | Main thread for the restore | the whole copy | 7.5 ms (the copy: 1.25 GB in ~0.8 s, 1.65 GB/s) |
 
 Every background save and both restores, target and draft, were identical to their synchronous counterparts.
+
+## 24. A small conversation that sets the top of the pool moves down
+
+Section 23's deferred replacement save cost BetterBench's concurrency levels 10%: the 4-request level began with one slot
+held 1.3 s while its 47k-token conversation was saved in the background, and the three other requests placed their new
+conversations above those cells meanwhile. They grew in place from there (each request reuses its slot's prefix), so for
+the rest of the level every step read ~47k masked cells: 77 ms a step instead of 69.5.
+
+`seq_compact` (`TAG_KV_SPAN`), which runs before a single sequence's prompt batch, now also moves a conversation of at most
+`LLAMA_KV_COMPACT_MAX` cells (default 1024) when it sets the top of the used cells and a free run at least
+`LLAMA_KV_SPAN_MIN` cells (default 4096; 0: off) below it holds it and its batch: one launch of the row-move kernel.
+
+BetterBench, same day, same launcher (aggregate decode, 1 / 2 / 4 requests; time to first token with 2 / 4):
+
+| Build | Aggregate | TTFT |
+|---|---|---|
+| Section 21 | 91.3 / 111.8 / 158.3 tok/s | 0.31 / 0.37 s |
+| Section 23 | 89.8 / 102.5 / 137.4 tok/s | 0.33 / 0.57 s |
+| This one | 90.9 / 117.7 / 156.3 tok/s | 0.31 / 0.37 s |
