@@ -1586,7 +1586,25 @@ bool llama_kv_cache::seq_compact(llama_seq_id seq_id, uint32_t n_next, const std
             room = cells.is_empty((uint32_t) last + k);
         }
         if (room) {
-            return false;
+            // [TAG_KV_SPAN] ... unless it sets the top of the used cells and a free run at least LLAMA_KV_SPAN_MIN (default 4096)
+            // cells below it holds it: then it moves down and every batch's window shrinks. The 4-request level of BetterBench
+            // began with one slot held 1.3 s while its 47k-token conversation was saved in the background (TAG_CACHE_BG_REPLACE);
+            // the other three placed their new conversations above those cells and grew them in place, and for the rest of
+            // the level every step read ~47k masked cells: 77 ms a step instead of 69.5, 137 tok/s instead of 158
+            static const uint32_t span_min = [] {
+                const char * e = getenv("LLAMA_KV_SPAN_MIN");
+                return e ? (uint32_t) std::max(0, atoi(e)) : 4096u;
+            }();
+            uint32_t c_min = UINT32_MAX;
+            uint32_t c_max = 0;
+            for (uint32_t i : idx) {
+                c_min = std::min(c_min, i);
+                c_max = std::max(c_max, i);
+            }
+            const int64_t low = span_min > 0 && c_max + 1 == cells.used_max_p1() ? free_run_for(cells, (uint32_t) idx.size() + n_next) : -1;
+            if (low < 0 || (uint64_t) low + idx.size() + n_next + span_min > c_min) {
+                return false;
+            }
         }
     }
 
